@@ -1,0 +1,5 @@
+# unrelated local file (do not commit)
+ltspice-mcp.toml
+
+.DS_Store
+node_modules/
