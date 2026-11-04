@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "X Tweet CSV Exporter (Local)",
+  "version": "0.1.0",
+  "description": "Export your public X posts to CSV locally. No server, no account, no API key.",
+  "permissions": ["storage"],
+  "host_permissions": ["https://x.com/*", "https://twitter.com/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://x.com/*", "https://twitter.com/*"],
+      "js": ["src/parser.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}
