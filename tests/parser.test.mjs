@@ -460,7 +460,7 @@ test('manifest keeps the frozen permissions and the S2 content-script wiring', (
     'https://twitter.com/*'
   ]);
   assert.equal(manifest.content_scripts[1].world, 'ISOLATED');
-  assert.equal(manifest.content_scripts[1].run_at, 'document_idle');
+  assert.equal(manifest.content_scripts[1].run_at, 'document_start');
 
   const serialized = JSON.stringify(manifest);
   assert.ok(!serialized.includes('webRequest'));

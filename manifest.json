@@ -15,7 +15,7 @@
     {
       "matches": ["https://x.com/*", "https://twitter.com/*"],
       "js": ["src/store.js", "src/content.js"],
-      "run_at": "document_idle",
+      "run_at": "document_start",
       "world": "ISOLATED"
     }
   ]

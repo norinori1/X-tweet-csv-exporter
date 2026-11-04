@@ -3,7 +3,7 @@
  *
  * Run with: node tests/collector.test.mjs
  *
- * Everything here is synthetic: a fake fetch/XHR, a fake chrome.storage.local
+ * Everything here is synthetic: fake fetch/XHR, a fake chrome.storage.local
  * and a fake clock. No network, no real extension APIs.
  */
 import assert from 'node:assert/strict';
@@ -36,6 +36,7 @@ function tick() {
 }
 
 async function settle() {
+  await tick();
   await tick();
   await tick();
 }
@@ -79,24 +80,93 @@ function makeRecord(id, extra) {
   );
 }
 
+function idsOf(records) {
+  return Array.from(records, (record) => String(record.id));
+}
+
+function tweetMessage(tweets, pathname, search, operation) {
+  return {
+    origin: 'https://x.com',
+    data: {
+      type: 'XTCE_TWEETS',
+      tweets,
+      source: {
+        pathname: pathname || '/alice',
+        search: search || '',
+        operation: operation || 'UserTweets'
+      }
+    }
+  };
+}
+
+function tweetMessages(entries) {
+  return entries.filter(
+    (entry) => entry && entry.message && entry.message.type === 'XTCE_TWEETS'
+  );
+}
+
+/* -------------------------------------------------------------------------
+ * Fake storage with controllable deferred/failing reads and writes
+ * ---------------------------------------------------------------------- */
+
 function createFakeStorage(initial) {
   const data = new Map();
   const calls = { get: [], set: [] };
+  const getHooks = [];
+  const setHooks = [];
   if (initial) {
     for (const key of Object.keys(initial)) {
       data.set(key, clone(initial[key]));
     }
+  }
+  function nextGate(hooks) {
+    const hook = hooks.shift();
+    return hook ? hook() : undefined;
+  }
+  function defer(hooks) {
+    let resolve;
+    let reject;
+    const promise = new Promise((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    hooks.push(() => promise);
+    return { promise, resolve, reject };
   }
   return {
     data,
     calls,
     async get(key) {
       calls.get.push(key);
+      const gate = nextGate(getHooks);
+      if (gate) {
+        await gate;
+      }
       return data.has(key) ? clone(data.get(key)) : undefined;
     },
     async set(key, value) {
       calls.set.push({ key, value: clone(value) });
+      const gate = nextGate(setHooks);
+      if (gate) {
+        await gate;
+      }
       data.set(key, clone(value));
+    },
+    deferNextGet() {
+      return defer(getHooks);
+    },
+    deferNextSet() {
+      return defer(setHooks);
+    },
+    failNextGet(error) {
+      getHooks.push(() => {
+        throw error;
+      });
+    },
+    failNextSet(error) {
+      setHooks.push(() => {
+        throw error;
+      });
     }
   };
 }
@@ -121,8 +191,14 @@ function createFakeScheduler() {
     delays() {
       return Array.from(pending.values(), (entry) => entry.ms);
     },
-    async runAll() {
+    async runAll(maxIterations) {
+      const limit = maxIterations || 1000;
+      let iterations = 0;
       while (pending.size > 0) {
+        iterations += 1;
+        if (iterations > limit) {
+          throw new Error('timer queue did not settle');
+        }
         const entry = pending.entries().next().value;
         pending.delete(entry[0]);
         await entry[1].fn();
@@ -131,8 +207,21 @@ function createFakeScheduler() {
   };
 }
 
-function createStoreHarness(initialStorage, persistDelay) {
-  const storage = createFakeStorage(initialStorage);
+function createFakeLockManager() {
+  const queues = new Map();
+  return {
+    request(name, task) {
+      const previous = queues.get(name) || Promise.resolve();
+      const run = previous.catch(() => {}).then(() => task());
+      queues.set(name, run.catch(() => {}));
+      return run;
+    }
+  };
+}
+
+function createStoreHarness(initialStorage, persistDelay, options) {
+  const opts = options || {};
+  const storage = opts.storage || createFakeStorage(initialStorage);
   const timers = createFakeScheduler();
   const sandbox = {
     console,
@@ -147,9 +236,34 @@ function createStoreHarness(initialStorage, persistDelay) {
     storage,
     persistDelay: persistDelay === undefined ? 500 : persistDelay,
     setTimeout: timers.setTimeout,
-    clearTimeout: timers.clearTimeout
+    clearTimeout: timers.clearTimeout,
+    withLock: opts.withLock
   });
   return { api, store, storage, timers, sandbox };
+}
+
+function createSharedStorePair(initialStorage) {
+  const storage = createFakeStorage(initialStorage);
+  const lock = createFakeLockManager();
+  const a = createStoreHarness(undefined, 500, {
+    storage,
+    withLock: lock.request
+  });
+  const b = createStoreHarness(undefined, 500, {
+    storage,
+    withLock: lock.request
+  });
+  return { storage, lock, a, b };
+}
+
+async function waitFor(predicate, label) {
+  for (let i = 0; i < 100; i += 1) {
+    if (predicate()) {
+      return;
+    }
+    await tick();
+  }
+  throw new Error('timed out waiting for ' + label);
 }
 
 /* -------------------------------------------------------------------------
@@ -164,11 +278,11 @@ function fixtureUser(screenName) {
   };
 }
 
-function fixtureTweetResult(id) {
+function fixtureTweetResult(id, screenName) {
   return {
     __typename: 'Tweet',
     rest_id: String(id),
-    core: { user_results: { result: fixtureUser('alice') } },
+    core: { user_results: { result: fixtureUser(screenName || 'alice') } },
     legacy: {
       id_str: String(id),
       created_at: 'Wed May 01 12:34:56 +0000 2024',
@@ -178,35 +292,42 @@ function fixtureTweetResult(id) {
   };
 }
 
-const interceptFixture = {
-  data: {
-    user: {
-      result: {
-        timeline_v2: {
-          timeline: {
-            instructions: [
-              {
-                type: 'TimelineAddEntries',
-                entries: [
-                  {
-                    entryId: 'tweet-1001',
-                    content: {
-                      entryType: 'TimelineTimelineItem',
-                      itemContent: {
-                        itemType: 'TimelineTweet',
-                        tweet_results: { result: fixtureTweetResult('1001') }
+function makeInterceptFixture(screenName, id) {
+  return {
+    data: {
+      user: {
+        result: {
+          timeline_v2: {
+            timeline: {
+              instructions: [
+                {
+                  type: 'TimelineAddEntries',
+                  entries: [
+                    {
+                      entryId: 'tweet-' + id,
+                      content: {
+                        entryType: 'TimelineTimelineItem',
+                        itemContent: {
+                          itemType: 'TimelineTweet',
+                          tweet_results: {
+                            result: fixtureTweetResult(id, screenName)
+                          }
+                        }
                       }
                     }
-                  }
-                ]
-              }
-            ]
+                  ]
+                }
+              ]
+            }
           }
         }
       }
     }
-  }
-};
+  };
+}
+
+const interceptFixture = makeInterceptFixture('alice', '1001');
+const bobInterceptFixture = makeInterceptFixture('bob', '2001');
 
 function makeResponse(payload) {
   return {
@@ -262,14 +383,33 @@ function createFakeXhrClass() {
 function createInterceptorHarness(options) {
   const opts = options || {};
   const messages = [];
+  const listeners = Object.create(null);
   const FakeXHR = createFakeXhrClass();
   const sandbox = {
     console,
     URL,
-    location: { href: 'https://x.com/alice', origin: 'https://x.com' },
+    location: {
+      pathname: '/alice',
+      search: '',
+      origin: 'https://x.com',
+      get href() {
+        return 'https://x.com' + this.pathname + this.search;
+      }
+    },
     XMLHttpRequest: FakeXHR,
     postMessage(message, targetOrigin) {
       messages.push({ message, targetOrigin });
+    },
+    addEventListener(type, listener) {
+      if (!listeners[type]) {
+        listeners[type] = [];
+      }
+      listeners[type].push(listener);
+    },
+    removeEventListener(type, listener) {
+      if (listeners[type]) {
+        listeners[type] = listeners[type].filter((item) => item !== listener);
+      }
     },
     setTimeout,
     clearTimeout
@@ -283,18 +423,110 @@ function createInterceptorHarness(options) {
     vm.runInContext(parserSource, sandbox, { filename: 'src/parser.js' });
   }
   vm.runInContext(interceptorSource, sandbox, { filename: 'src/interceptor.js' });
-  return { sandbox, messages, FakeXHR };
+  function emitMessage(event) {
+    const list = (listeners.message || []).slice();
+    for (const listener of list) {
+      listener.call(sandbox, event);
+    }
+  }
+  // Most hook tests assume a collector is already listening. The ordering
+  // regressions pass { ready: false } to exercise the buffer instead.
+  if (opts.ready !== false) {
+    emitMessage({
+      origin: 'https://x.com',
+      data: { type: 'XTCE_COLLECTOR_READY' }
+    });
+  }
+  return {
+    sandbox,
+    messages,
+    FakeXHR,
+    emitMessage
+  };
 }
 
 /* -------------------------------------------------------------------------
  * Isolated-world collector harness: fake window, chrome.storage and clock
  * ---------------------------------------------------------------------- */
 
-function createContentHarness(initialStorage, pathname, search) {
-  const storage = createFakeStorage(initialStorage);
+function createFakeChrome(storage) {
+  const onChanged = [];
+  const runtime = {};
+  function setLastError(error) {
+    runtime.lastError = {
+      message: error && error.message ? error.message : String(error)
+    };
+  }
+  function clearLastError() {
+    delete runtime.lastError;
+  }
+  const chrome = {
+    runtime,
+    storage: {
+      local: {
+        get(key, callback) {
+          storage.get(key).then(
+            (value) => {
+              const items = {};
+              if (value !== undefined) {
+                items[key] = value;
+              }
+              clearLastError();
+              callback(items);
+            },
+            (error) => {
+              setLastError(error);
+              try {
+                callback({});
+              } finally {
+                clearLastError();
+              }
+            }
+          );
+        },
+        set(items, callback) {
+          const keys = Object.keys(items);
+          storage.set(keys[0], items[keys[0]]).then(
+            () => {
+              clearLastError();
+              if (callback) {
+                callback();
+              }
+            },
+            (error) => {
+              setLastError(error);
+              try {
+                if (callback) {
+                  callback();
+                }
+              } finally {
+                clearLastError();
+              }
+            }
+          );
+        }
+      },
+      onChanged: {
+        addListener(listener) {
+          onChanged.push(listener);
+        },
+        removeListener(listener) {
+          const index = onChanged.indexOf(listener);
+          if (index !== -1) {
+            onChanged.splice(index, 1);
+          }
+        }
+      }
+    }
+  };
+  return { chrome, onChanged };
+}
+
+function createContentHarnessWithStorage(storage, pathname, search) {
   const timers = createFakeScheduler();
   const listeners = Object.create(null);
   const intervals = [];
+  const fakeChrome = createFakeChrome(storage);
   const sandbox = {
     console,
     setTimeout: timers.setTimeout,
@@ -304,36 +536,7 @@ function createContentHarness(initialStorage, pathname, search) {
       return intervals.length;
     },
     clearInterval() {},
-    chrome: {
-      runtime: {},
-      storage: {
-        local: {
-          get(key, callback) {
-            storage.get(key).then(
-              (value) => {
-                const items = {};
-                if (value !== undefined) {
-                  items[key] = value;
-                }
-                callback(items);
-              },
-              () => callback({})
-            );
-          },
-          set(items, callback) {
-            const keys = Object.keys(items);
-            storage.set(keys[0], items[keys[0]]).then(
-              () => {
-                if (callback) callback();
-              },
-              () => {
-                if (callback) callback();
-              }
-            );
-          }
-        }
-      }
-    },
+    chrome: fakeChrome.chrome,
     location: {
       pathname: pathname || '/alice',
       search: search || '',
@@ -364,11 +567,175 @@ function createContentHarness(initialStorage, pathname, search) {
     timers,
     listeners,
     intervals,
+    chrome: fakeChrome.chrome,
     emit(type, event) {
       const list = (listeners[type] || []).slice();
       for (const listener of list) {
         listener.call(sandbox, event);
       }
+    },
+    emitStorageChange(changes, areaName) {
+      const list = fakeChrome.onChanged.slice();
+      for (const listener of list) {
+        listener(changes, areaName || 'local');
+      }
+    }
+  };
+}
+
+function createContentHarness(initialStorage, pathname, search) {
+  return createContentHarnessWithStorage(
+    createFakeStorage(initialStorage),
+    pathname,
+    search
+  );
+}
+
+/* -------------------------------------------------------------------------
+ * Two-world harness: MAIN interceptor and ISOLATED collector share a fake
+ * window message bus, location and chrome.storage. This is the realistic
+ * ordering regression used for early responses and late attribution.
+ * ---------------------------------------------------------------------- */
+
+function createTwoWorldHarness(options) {
+  const opts = options || {};
+  const storage = createFakeStorage(opts.initialStorage);
+  const timers = createFakeScheduler();
+  const intervals = [];
+  const location = {
+    pathname: opts.pathname || '/alice',
+    search: opts.search || '',
+    origin: 'https://x.com',
+    get href() {
+      return 'https://x.com' + this.pathname + this.search;
+    }
+  };
+  const mainListeners = Object.create(null);
+  const isolatedListeners = Object.create(null);
+  const posted = [];
+  const deliveries = [];
+  const errors = [];
+  const fakeChrome = createFakeChrome(storage);
+  let dispatchScheduled = false;
+
+  function addListener(map, type, listener) {
+    if (!map[type]) {
+      map[type] = [];
+    }
+    map[type].push(listener);
+  }
+  function removeListener(map, type, listener) {
+    if (map[type]) {
+      map[type] = map[type].filter((item) => item !== listener);
+    }
+  }
+  function dispatch() {
+    dispatchScheduled = false;
+    while (deliveries.length > 0) {
+      const event = deliveries.shift();
+      for (const map of [mainListeners, isolatedListeners]) {
+        const list = (map.message || []).slice();
+        for (const listener of list) {
+          try {
+            listener.call(null, event);
+          } catch (error) {
+            errors.push(error);
+          }
+        }
+      }
+    }
+  }
+  function post(world, message, targetOrigin) {
+    posted.push({ world, message, targetOrigin });
+    deliveries.push({ origin: location.origin, data: message, source: null });
+    if (!dispatchScheduled) {
+      dispatchScheduled = true;
+      Promise.resolve().then(dispatch);
+    }
+  }
+
+  const main = {
+    console,
+    URL,
+    location,
+    XMLHttpRequest: createFakeXhrClass(),
+    postMessage(message, targetOrigin) {
+      post('main', message, targetOrigin);
+    },
+    addEventListener(type, listener) {
+      addListener(mainListeners, type, listener);
+    },
+    removeEventListener(type, listener) {
+      removeListener(mainListeners, type, listener);
+    },
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout
+  };
+  main.fetch = opts.fetch
+    ? opts.fetch
+    : () => Promise.resolve(makeResponse(opts.payload || interceptFixture));
+  main.window = main;
+  vm.createContext(main);
+
+  const isolated = {
+    console,
+    location,
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout,
+    setInterval(fn, ms) {
+      intervals.push({ fn, ms });
+      return intervals.length;
+    },
+    clearInterval() {},
+    chrome: fakeChrome.chrome,
+    postMessage(message, targetOrigin) {
+      post('isolated', message, targetOrigin);
+    },
+    addEventListener(type, listener) {
+      addListener(isolatedListeners, type, listener);
+    },
+    removeEventListener(type, listener) {
+      removeListener(isolatedListeners, type, listener);
+    }
+  };
+  isolated.window = isolated;
+  vm.createContext(isolated);
+
+  return {
+    main,
+    isolated,
+    storage,
+    timers,
+    intervals,
+    posted,
+    errors,
+    loadInterceptor() {
+      vm.runInContext(parserSource, main, { filename: 'src/parser.js' });
+      vm.runInContext(interceptorSource, main, { filename: 'src/interceptor.js' });
+    },
+    loadCollector() {
+      vm.runInContext(storeSource, isolated, { filename: 'src/store.js' });
+      vm.runInContext(contentSource, isolated, { filename: 'src/content.js' });
+    },
+    navigate(pathname, search) {
+      location.pathname = pathname;
+      location.search = search || '';
+    },
+    tickInterval() {
+      for (const entry of intervals) {
+        entry.fn();
+      }
+    },
+    async settle() {
+      await settle();
+      if (errors.length > 0) {
+        throw errors[0];
+      }
+    },
+    tweetMessages() {
+      return posted.filter(
+        (entry) => entry.message && entry.message.type === 'XTCE_TWEETS'
+      );
     }
   };
 }
@@ -383,6 +750,8 @@ await test('store loads in vm and exposes the S2 helpers', () => {
   assert.equal(typeof api.usernameFromPath, 'function');
   assert.equal(typeof api.usernameFromLocation, 'function');
   assert.equal(typeof api.isTweetMessage, 'function');
+  assert.equal(typeof api.recordsFromStored, 'function');
+  assert.equal(typeof api.normalizeUsername, 'function');
   assert.equal(api.STORAGE_PREFIX, 'xtce_');
   assert.deepEqual(
     [...api.RESERVED_SEGMENTS],
@@ -504,7 +873,7 @@ await test('store switches per-user buckets and persists each one', async () => 
   const state = store.getState();
   assert.equal(state.username, 'alice');
   assert.equal(state.count, 2);
-  assert.deepEqual(Array.from(state.records, (record) => record.id), ['1', '2']);
+  assert.deepEqual(idsOf(state.records), ['1', '2']);
 });
 
 await test('store restores object and bare-array payloads from storage', async () => {
@@ -520,11 +889,11 @@ await test('store restores object and bare-array payloads from storage', async (
   await store.switchUser('carol');
   let state = store.getState();
   assert.equal(state.count, 2);
-  assert.deepEqual(Array.from(state.records, (record) => String(record.id)), ['10', '11']);
+  assert.deepEqual(idsOf(state.records), ['10', '11']);
   await store.switchUser('dave');
   state = store.getState();
   assert.equal(state.count, 1);
-  assert.deepEqual(Array.from(state.records, (record) => record.id), ['12']);
+  assert.deepEqual(idsOf(state.records), ['12']);
 });
 
 await test('store throttles persistence into one write per 500 ms window', async () => {
@@ -580,6 +949,164 @@ await test('store notifies subscribers and unsubscribes cleanly', async () => {
 });
 
 /* -------------------------------------------------------------------------
+ * Store durability regressions (review items 3, 4, 5)
+ * ---------------------------------------------------------------------- */
+
+await test('store waits for an in-flight restore before writing a merge', async () => {
+  const harness = createStoreHarness({
+    xtce_alice: { version: 1, username: 'alice', records: [makeRecord(1)] }
+  });
+  const gate = harness.storage.deferNextGet();
+  const switching = harness.store.switchUser('alice');
+  harness.store.ingest([makeRecord(2)]);
+  const flushing = harness.store.flushNow();
+  await settle();
+  assert.equal(
+    harness.storage.calls.set.length,
+    0,
+    'a partial snapshot must not overwrite stored records before the read settles'
+  );
+  gate.resolve();
+  await switching;
+  await flushing;
+  assert.deepEqual(
+    idsOf(harness.storage.data.get('xtce_alice').records).sort(),
+    ['1', '2']
+  );
+  assert.equal(harness.store.getState().count, 2);
+});
+
+await test('store does not write a partial snapshot when the read fails and retries', async () => {
+  const harness = createStoreHarness({
+    xtce_alice: { version: 1, username: 'alice', records: [makeRecord(1)] }
+  });
+  const gate = harness.storage.deferNextGet();
+  const switching = harness.store.switchUser('alice');
+  harness.store.ingest([makeRecord(2)]);
+  const flushing = harness.store.flushNow();
+  await settle();
+  assert.equal(harness.storage.calls.set.length, 0);
+  gate.reject(new Error('storage read failed'));
+  await switching;
+  await assert.rejects(flushing, /storage read failed/);
+  assert.equal(
+    harness.storage.calls.set.length,
+    0,
+    'a failed read must not overwrite storage'
+  );
+  assert.match(harness.store.getState().error.message, /storage read failed/);
+  await harness.timers.runAll();
+  assert.deepEqual(
+    idsOf(harness.storage.data.get('xtce_alice').records).sort(),
+    ['1', '2']
+  );
+  assert.equal(harness.store.getState().error, null);
+});
+
+await test('store clearCurrent is not undone by a delayed restore', async () => {
+  const harness = createStoreHarness({
+    xtce_alice: {
+      version: 1,
+      username: 'alice',
+      records: [makeRecord(1), makeRecord(2)]
+    }
+  });
+  const gate = harness.storage.deferNextGet();
+  const switching = harness.store.switchUser('alice');
+  const clearing = harness.store.clearCurrent();
+  await settle();
+  gate.resolve();
+  await switching;
+  await clearing;
+  await harness.store.flushNow();
+  assert.equal(harness.store.getState().count, 0);
+  assert.deepEqual(harness.storage.data.get('xtce_alice').records, []);
+});
+
+await test('store retries a failed clear without resurrecting records', async () => {
+  const harness = createStoreHarness({
+    xtce_alice: { version: 1, username: 'alice', records: [makeRecord(1)] }
+  });
+  await harness.store.switchUser('alice');
+  harness.storage.failNextSet(new Error('QUOTA_BYTES quota exceeded'));
+  await assert.rejects(harness.store.clearCurrent(), /quota/i);
+  assert.match(harness.store.getState().error.message, /quota/i);
+  assert.equal(harness.store.getState().count, 0);
+  assert.equal(
+    harness.storage.data.get('xtce_alice').records.length,
+    1,
+    'the failed clear must leave storage untouched'
+  );
+  await harness.timers.runAll();
+  assert.deepEqual(harness.storage.data.get('xtce_alice').records, []);
+  assert.equal(harness.store.getState().error, null);
+});
+
+await test('store propagates quota failures, keeps the bucket dirty and retries', async () => {
+  const harness = createStoreHarness();
+  await harness.store.switchUser('alice');
+  harness.store.ingest([makeRecord(1)]);
+  harness.storage.failNextSet(new Error('QUOTA_BYTES quota exceeded'));
+  await assert.rejects(harness.store.flushNow(), /quota/i);
+  assert.match(harness.store.getState().error.message, /quota/i);
+  assert.equal(harness.store.getState().error.operation, 'flush');
+  assert.equal(harness.storage.data.has('xtce_alice'), false);
+  assert.ok(harness.timers.pendingCount() > 0, 'a retry must be scheduled');
+  await harness.timers.runAll();
+  assert.equal(harness.storage.data.get('xtce_alice').records.length, 1);
+  assert.equal(harness.store.getState().error, null);
+});
+
+await test('two stores on the same user merge interleaved writes', async () => {
+  const pair = createSharedStorePair();
+  await pair.a.store.switchUser('alice');
+  await pair.b.store.switchUser('alice');
+  pair.a.store.ingest([makeRecord(1)]);
+  pair.b.store.ingest([makeRecord(2)]);
+
+  const gate = pair.storage.deferNextSet();
+  const flushingA = pair.a.store.flushNow();
+  await waitFor(() => pair.storage.calls.set.length === 1, 'first write to start');
+  const flushingB = pair.b.store.flushNow();
+  await settle();
+  assert.equal(
+    pair.storage.calls.set.length,
+    1,
+    'the second writer must wait for the user lock'
+  );
+  gate.resolve();
+  await Promise.all([flushingA, flushingB]);
+
+  assert.deepEqual(
+    idsOf(pair.storage.data.get('xtce_alice').records).sort(),
+    ['1', '2']
+  );
+  assert.deepEqual(
+    idsOf(pair.b.store.getState().records).sort(),
+    ['1', '2'],
+    'the second store merges the first snapshot into memory'
+  );
+
+  pair.a.store.ingest([makeRecord(3)]);
+  pair.b.store.ingest([makeRecord(4)]);
+  await pair.a.store.flushNow();
+  await pair.b.store.flushNow();
+  assert.deepEqual(
+    idsOf(pair.storage.data.get('xtce_alice').records).sort(),
+    ['1', '2', '3', '4']
+  );
+});
+
+await test('store merges records written by another tab without marking them dirty', async () => {
+  const harness = createStoreHarness();
+  await harness.store.switchUser('alice');
+  assert.equal(harness.store.mergeExternal('alice', [makeRecord(9)]), 1);
+  assert.equal(harness.store.getState().count, 1);
+  assert.equal(harness.timers.pendingCount(), 0, 'external records are already stored');
+  assert.equal(harness.store.mergeExternal('alice', [makeRecord(9)]), 0);
+});
+
+/* -------------------------------------------------------------------------
  * Manifest test
  * ---------------------------------------------------------------------- */
 
@@ -604,7 +1131,11 @@ await test('manifest wires MAIN interceptor and isolated collector with frozen p
   assert.deepEqual(isolated.js, ['src/store.js', 'src/content.js']);
   assert.deepEqual(isolated.matches, ['https://x.com/*', 'https://twitter.com/*']);
   assert.equal(isolated.world, 'ISOLATED');
-  assert.equal(isolated.run_at, 'document_idle');
+  assert.equal(
+    isolated.run_at,
+    'document_start',
+    'the collector must listen before early page responses'
+  );
 
   const serialized = JSON.stringify(manifest);
   assert.ok(!serialized.includes('webRequest'));
@@ -633,11 +1164,11 @@ await test('interceptor hooks fetch and posts extracted target tweets', async ()
   );
   assert.equal(response.status, 200);
   await settle();
-  assert.equal(messages.length, 1);
-  assert.equal(messages[0].targetOrigin, 'https://x.com');
-  assert.equal(messages[0].message.type, 'XTCE_TWEETS');
-  assert.equal(messages[0].message.tweets.length, 1);
-  assert.equal(messages[0].message.tweets[0].id, '1001');
+  const tweets = tweetMessages(messages);
+  assert.equal(tweets.length, 1);
+  assert.equal(tweets[0].targetOrigin, 'https://x.com');
+  assert.equal(tweets[0].message.tweets.length, 1);
+  assert.equal(tweets[0].message.tweets[0].id, '1001');
 });
 
 await test('interceptor accepts URL and Request-like fetch inputs', async () => {
@@ -645,7 +1176,7 @@ await test('interceptor accepts URL and Request-like fetch inputs', async () => 
   await sandbox.fetch(new URL('https://x.com/i/api/graphql/abc/UserTweets'));
   await sandbox.fetch({ url: 'https://x.com/i/api/graphql/abc/SearchTimeline' });
   await settle();
-  assert.equal(messages.length, 2);
+  assert.equal(tweetMessages(messages).length, 2);
 });
 
 await test('interceptor accepts every listed operation and ignores other URLs', async () => {
@@ -666,15 +1197,15 @@ await test('interceptor accepts every listed operation and ignores other URLs', 
     await sandbox.fetch('https://x.com/i/api/graphql/abc/' + operation + '?variables=%7B%7D');
   }
   await settle();
-  assert.equal(messages.length, operations.length);
+  assert.equal(tweetMessages(messages).length, operations.length);
 
-  const beforeIgnored = messages.length;
+  const beforeIgnored = tweetMessages(messages).length;
   await sandbox.fetch('https://x.com/i/api/graphql/abc/OtherTimeline');
   await sandbox.fetch('https://x.com/i/api/2/guide.json');
   await sandbox.fetch('https://x.com/normal/page');
   await sandbox.fetch('https://example.com/i/api/graphql/abc/UserTweets');
   await settle();
-  assert.equal(messages.length, beforeIgnored);
+  assert.equal(tweetMessages(messages).length, beforeIgnored);
 });
 
 await test('interceptor hooks XHR open/send for text and json responses', async () => {
@@ -687,7 +1218,7 @@ await test('interceptor hooks XHR open/send for text and json responses', async 
   textXhr.responseText = JSON.stringify(interceptFixture);
   textXhr.emit('load');
   await tick();
-  assert.equal(messages.length, 1);
+  assert.equal(tweetMessages(messages).length, 1);
 
   const jsonXhr = new sandbox.XMLHttpRequest();
   jsonXhr.open('POST', 'https://x.com/i/api/graphql/abc/SearchTimeline');
@@ -697,7 +1228,7 @@ await test('interceptor hooks XHR open/send for text and json responses', async 
   jsonXhr.response = interceptFixture;
   jsonXhr.emit('load');
   await tick();
-  assert.equal(messages.length, 2);
+  assert.equal(tweetMessages(messages).length, 2);
 });
 
 await test('interceptor ignores non-target, failed and malformed XHR responses', async () => {
@@ -725,7 +1256,7 @@ await test('interceptor ignores non-target, failed and malformed XHR responses',
   badJson.emit('load');
   await tick();
 
-  assert.equal(messages.length, 0);
+  assert.equal(tweetMessages(messages).length, 0);
 });
 
 await test('interceptor never surfaces parser/JSON failures into page code', async () => {
@@ -746,7 +1277,7 @@ await test('interceptor never surfaces parser/JSON failures into page code', asy
   );
   assert.ok(response);
   await settle();
-  assert.equal(badJson.messages.length, 0);
+  assert.equal(tweetMessages(badJson.messages).length, 0);
 
   const rejecting = createInterceptorHarness({
     fetch: () => Promise.reject(new Error('network'))
@@ -756,7 +1287,7 @@ await test('interceptor never surfaces parser/JSON failures into page code', asy
     /network/
   );
   await settle();
-  assert.equal(rejecting.messages.length, 0);
+  assert.equal(tweetMessages(rejecting.messages).length, 0);
 
   const noParser = createInterceptorHarness({ withParser: false });
   const noParserResponse = await noParser.sandbox.fetch(
@@ -764,7 +1295,7 @@ await test('interceptor never surfaces parser/JSON failures into page code', asy
   );
   assert.ok(noParserResponse);
   await settle();
-  assert.equal(noParser.messages.length, 0);
+  assert.equal(tweetMessages(noParser.messages).length, 0);
 });
 
 await test('interceptor installs only once', async () => {
@@ -773,7 +1304,68 @@ await test('interceptor installs only once', async () => {
   vm.runInContext(interceptorSource, sandbox, { filename: 'src/interceptor.js' });
   await sandbox.fetch('https://x.com/i/api/graphql/abc/UserTweets');
   await settle();
-  assert.equal(messages.length, 1);
+  assert.equal(tweetMessages(messages).length, 1);
+});
+
+await test('interceptor buffers timeline batches until the collector is ready', async () => {
+  const harness = createInterceptorHarness({ ready: false });
+  await harness.sandbox.fetch('https://x.com/i/api/graphql/abc/UserTweets');
+  await settle();
+  assert.equal(
+    tweetMessages(harness.messages).length,
+    0,
+    'a batch received before READY must be buffered, not dropped'
+  );
+  harness.emitMessage({
+    origin: 'https://x.com',
+    data: { type: 'XTCE_COLLECTOR_READY' }
+  });
+  await settle();
+  const tweets = tweetMessages(harness.messages);
+  assert.equal(tweets.length, 1);
+  assert.equal(tweets[0].message.tweets[0].id, '1001');
+});
+
+await test('interceptor stamps the request-time route and operation', async () => {
+  const harness = createInterceptorHarness();
+  let release;
+  const pending = new Promise((resolve) => {
+    release = resolve;
+  });
+  const delayed = createInterceptorHarness({ fetch: () => pending });
+
+  const first = harness.sandbox.fetch(
+    'https://x.com/i/api/graphql/abc/UserTweets'
+  );
+  harness.sandbox.location.pathname = '/bob';
+  await first;
+  await settle();
+  const firstMessage = tweetMessages(harness.messages)[0].message;
+  assert.equal(firstMessage.source.pathname, '/alice');
+  assert.equal(firstMessage.source.operation, 'UserTweets');
+
+  const xhr = new harness.sandbox.XMLHttpRequest();
+  harness.sandbox.location.pathname = '/alice';
+  xhr.open('GET', 'https://x.com/i/api/graphql/abc/UserTweets');
+  xhr.send();
+  harness.sandbox.location.pathname = '/bob';
+  xhr.status = 200;
+  xhr.responseText = JSON.stringify(interceptFixture);
+  xhr.emit('load');
+  await tick();
+  const xhrMessage = tweetMessages(harness.messages).pop().message;
+  assert.equal(xhrMessage.source.pathname, '/alice');
+
+  const second = delayed.sandbox.fetch(
+    'https://x.com/i/api/graphql/abc/UserTweets'
+  );
+  delayed.sandbox.location.pathname = '/bob';
+  release(makeResponse(interceptFixture));
+  await second;
+  await settle();
+  const delayedMessage = tweetMessages(delayed.messages)[0].message;
+  assert.equal(delayedMessage.source.pathname, '/alice');
+  assert.equal(delayedMessage.source.operation, 'UserTweets');
 });
 
 /* -------------------------------------------------------------------------
@@ -787,17 +1379,19 @@ await test('content collector receives batches, dedupes and persists', async () 
   assert.equal(state.username, 'alice');
   assert.equal(state.count, 0);
 
-  harness.emit('message', {
-    origin: 'https://x.com',
-    data: { type: 'XTCE_TWEETS', tweets: [makeRecord(1), makeRecord(2), makeRecord(2)] }
-  });
+  harness.emit(
+    'message',
+    tweetMessage([makeRecord(1), makeRecord(2), makeRecord(2)])
+  );
+  await settle();
   state = harness.sandbox.__XTCE_content.getState();
   assert.equal(state.count, 2);
 
-  harness.emit('message', {
-    origin: 'https://x.com',
-    data: { type: 'XTCE_TWEETS', tweets: [makeRecord(2, { text: 'new' }), makeRecord(3)] }
-  });
+  harness.emit(
+    'message',
+    tweetMessage([makeRecord(2, { text: 'new' }), makeRecord(3)])
+  );
+  await settle();
   state = harness.sandbox.__XTCE_content.getState();
   assert.equal(state.count, 3);
   assert.equal(state.records.find((record) => record.id === '2').text, 'new');
@@ -818,15 +1412,19 @@ await test('content collector restores an existing bucket on load', async () => 
   const state = harness.sandbox.__XTCE_content.getState();
   assert.equal(state.username, 'alice');
   assert.equal(state.count, 2);
-  assert.deepEqual(Array.from(state.records, (record) => record.id), ['50', '51']);
+  assert.deepEqual(idsOf(state.records), ['50', '51']);
 });
 
-await test('content collector rejects wrong-origin, wrong-type and malformed messages', async () => {
+await test('content collector rejects wrong-origin, wrong-type, malformed and unbound messages', async () => {
   const harness = createContentHarness();
   await settle();
   harness.emit('message', {
     origin: 'https://evil.example',
-    data: { type: 'XTCE_TWEETS', tweets: [makeRecord(1)] }
+    data: {
+      type: 'XTCE_TWEETS',
+      tweets: [makeRecord(1)],
+      source: { pathname: '/alice', search: '' }
+    }
   });
   harness.emit('message', {
     origin: 'https://x.com',
@@ -837,19 +1435,33 @@ await test('content collector rejects wrong-origin, wrong-type and malformed mes
     data: { type: 'XTCE_TWEETS', tweets: 'nope' }
   });
   harness.emit('message', {});
+  harness.emit('message', {
+    origin: 'https://x.com',
+    data: { type: 'XTCE_TWEETS', tweets: [makeRecord(3)] }
+  });
+  harness.emit('message', {
+    origin: 'https://x.com',
+    data: {
+      type: 'XTCE_TWEETS',
+      tweets: [makeRecord(4)],
+      source: { pathname: 'alice', search: '' }
+    }
+  });
   await settle();
   assert.equal(harness.sandbox.__XTCE_content.getState().count, 0);
 });
 
 await test('content collector switches and restores per-user buckets on SPA navigation', async () => {
   const harness = createContentHarness({
-    xtce_bob: { version: 1, username: 'bob', records: [makeRecord(20)] }
+    xtce_bob: {
+      version: 1,
+      username: 'bob',
+      records: [makeRecord(20, { author_username: 'bob' })]
+    }
   });
   await settle();
-  harness.emit('message', {
-    origin: 'https://x.com',
-    data: { type: 'XTCE_TWEETS', tweets: [makeRecord(1)] }
-  });
+  harness.emit('message', tweetMessage([makeRecord(1)], '/alice'));
+  await settle();
   assert.equal(harness.sandbox.__XTCE_content.getState().count, 1);
 
   harness.sandbox.location.pathname = '/bob';
@@ -859,12 +1471,13 @@ await test('content collector switches and restores per-user buckets on SPA navi
   let state = harness.sandbox.__XTCE_content.getState();
   assert.equal(state.username, 'bob');
   assert.equal(state.count, 1);
-  assert.deepEqual(Array.from(state.records, (record) => record.id), ['20']);
+  assert.deepEqual(idsOf(state.records), ['20']);
 
-  harness.emit('message', {
-    origin: 'https://x.com',
-    data: { type: 'XTCE_TWEETS', tweets: [makeRecord(21)] }
-  });
+  harness.emit(
+    'message',
+    tweetMessage([makeRecord(21, { author_username: 'bob' })], '/bob')
+  );
+  await settle();
   assert.equal(harness.sandbox.__XTCE_content.getState().count, 2);
   await harness.sandbox.__XTCE_content.flush();
   assert.equal(harness.storage.data.get('xtce_bob').records.length, 2);
@@ -886,10 +1499,16 @@ await test('content collector uses /search?q=from:user and ignores /home', async
   );
   await settle();
   assert.equal(search.sandbox.__XTCE_content.getState().username, 'alice');
-  search.emit('message', {
-    origin: 'https://x.com',
-    data: { type: 'XTCE_TWEETS', tweets: [makeRecord(30)] }
-  });
+  search.emit(
+    'message',
+    tweetMessage(
+      [makeRecord(30)],
+      '/search',
+      '?q=from%3Aalice%20since%3A2020-01-01&f=live',
+      'SearchTimeline'
+    )
+  );
+  await settle();
   assert.equal(search.sandbox.__XTCE_content.getState().count, 1);
   await search.sandbox.__XTCE_content.flush();
   assert.equal(search.storage.data.get('xtce_alice').records.length, 1);
@@ -897,23 +1516,19 @@ await test('content collector uses /search?q=from:user and ignores /home', async
   const home = createContentHarness({}, '/home', '');
   await settle();
   assert.equal(home.sandbox.__XTCE_content.getState().username, null);
-  home.emit('message', {
-    origin: 'https://x.com',
-    data: { type: 'XTCE_TWEETS', tweets: [makeRecord(40)] }
-  });
+  home.emit('message', tweetMessage([makeRecord(40)], '/home'));
+  await settle();
   assert.equal(home.sandbox.__XTCE_content.getState().count, 0);
 });
 
 await test('content collector flushes on pagehide and clearCurrent empties the bucket', async () => {
   const harness = createContentHarness();
   await settle();
-  harness.emit('message', {
-    origin: 'https://x.com',
-    data: { type: 'XTCE_TWEETS', tweets: [makeRecord(1), makeRecord(2)] }
-  });
+  harness.emit('message', tweetMessage([makeRecord(1), makeRecord(2)]));
+  await settle();
   assert.equal(harness.storage.data.has('xtce_alice'), false);
   harness.emit('pagehide', {});
-  await settle();
+  await waitFor(() => harness.storage.data.has('xtce_alice'), 'pagehide flush');
   assert.equal(harness.storage.data.get('xtce_alice').records.length, 2);
 
   await harness.sandbox.__XTCE_content.clearCurrent();
@@ -921,27 +1536,287 @@ await test('content collector flushes on pagehide and clearCurrent empties the b
   assert.equal(harness.storage.data.get('xtce_alice').records.length, 0);
 });
 
-await test('content collector exposes getState/subscribe for S3', async () => {
+await test('content collector exposes getState/getUsername/subscribe/error API for S3', async () => {
   const harness = createContentHarness();
   await settle();
   const api = harness.sandbox.__XTCE_content;
   assert.equal(typeof api.getState, 'function');
-  assert.equal(typeof api.subscribe, 'function');
+  assert.equal(typeof api.getUsername, 'function');
+  assert.equal(typeof api.getLastError, 'function');
+  assert.equal(typeof api.clearError, 'function');
+  assert.equal(api.getUsername(), 'alice');
+  assert.equal(api.getLastError(), null);
   const seen = [];
   const unsubscribe = api.subscribe((state) => {
     seen.push(state.count);
   });
-  harness.emit('message', {
-    origin: 'https://x.com',
-    data: { type: 'XTCE_TWEETS', tweets: [makeRecord(1)] }
-  });
+  harness.emit('message', tweetMessage([makeRecord(1)]));
+  await settle();
   assert.deepEqual(seen, [1]);
   unsubscribe();
-  harness.emit('message', {
-    origin: 'https://x.com',
-    data: { type: 'XTCE_TWEETS', tweets: [makeRecord(2)] }
-  });
+  harness.emit('message', tweetMessage([makeRecord(2)]));
+  await settle();
   assert.equal(seen.length, 1);
+});
+
+await test('content collector filters other authors from TweetDetail and Likes', async () => {
+  const harness = createContentHarness();
+  await settle();
+  harness.emit(
+    'message',
+    tweetMessage(
+      [
+        makeRecord(1, { author_username: 'alice' }),
+        makeRecord(2, { author_username: 'bob' })
+      ],
+      '/alice',
+      '',
+      'TweetDetail'
+    )
+  );
+  await settle();
+  assert.deepEqual(idsOf(harness.sandbox.__XTCE_content.getState().records), ['1']);
+
+  harness.emit(
+    'message',
+    tweetMessage(
+      [
+        makeRecord(3, { author_username: 'bob' }),
+        makeRecord(4, { author_username: 'carol' })
+      ],
+      '/alice',
+      '',
+      'Likes'
+    )
+  );
+  await settle();
+  assert.equal(harness.sandbox.__XTCE_content.getState().count, 1);
+
+  harness.emit(
+    'message',
+    tweetMessage(
+      [
+        makeRecord(5, { author_username: 'alice' }),
+        makeRecord(6, { author_username: 'bob' })
+      ],
+      '/search',
+      '?q=from%3Aalice',
+      'SearchTimeline'
+    )
+  );
+  await settle();
+  assert.deepEqual(
+    idsOf(harness.sandbox.__XTCE_content.getState().records),
+    ['1', '5']
+  );
+});
+
+await test('content collector catches up to pushState without waiting for the poll', async () => {
+  const harness = createContentHarness();
+  await settle();
+  assert.equal(harness.sandbox.__XTCE_content.getUsername(), 'alice');
+  harness.sandbox.location.pathname = '/bob';
+  harness.sandbox.location.search = '';
+  harness.emit(
+    'message',
+    tweetMessage([makeRecord(7, { author_username: 'bob' })], '/bob')
+  );
+  await settle();
+  const state = harness.sandbox.__XTCE_content.getState();
+  assert.equal(state.username, 'bob');
+  assert.equal(state.count, 1);
+  await harness.sandbox.__XTCE_content.flush();
+  assert.equal(harness.storage.data.get('xtce_bob').records.length, 1);
+  assert.equal(harness.storage.data.has('xtce_alice'), false);
+});
+
+await test('content collector merges records written by another tab', async () => {
+  const harness = createContentHarness();
+  await settle();
+  harness.emitStorageChange({
+    xtce_alice: {
+      newValue: {
+        version: 1,
+        username: 'alice',
+        records: [makeRecord(70)]
+      }
+    }
+  });
+  const state = harness.sandbox.__XTCE_content.getState();
+  assert.equal(state.count, 1);
+  assert.deepEqual(idsOf(state.records), ['70']);
+  assert.equal(harness.timers.pendingCount(), 0);
+});
+
+await test('content collector propagates chrome.runtime.lastError and retries quota failures', async () => {
+  const harness = createContentHarness();
+  await settle();
+  harness.storage.failNextSet(new Error('QUOTA_BYTES quota exceeded'));
+  harness.emit('message', tweetMessage([makeRecord(80)]));
+  await settle();
+  await assert.rejects(harness.sandbox.__XTCE_content.flush(), /quota/i);
+  assert.match(
+    harness.sandbox.__XTCE_content.getLastError().message,
+    /quota/i
+  );
+  assert.equal(
+    harness.sandbox.__XTCE_content.getState().error.operation,
+    'flush'
+  );
+  assert.equal(harness.storage.data.has('xtce_alice'), false);
+  await harness.timers.runAll();
+  assert.equal(harness.storage.data.get('xtce_alice').records.length, 1);
+  assert.equal(harness.sandbox.__XTCE_content.getLastError(), null);
+});
+
+await test('content collector exposes storage read failures instead of treating them as empty', async () => {
+  const storage = createFakeStorage({
+    xtce_alice: {
+      version: 1,
+      username: 'alice',
+      records: [makeRecord(90)]
+    }
+  });
+  storage.failNextGet(new Error('storage read failed'));
+  const harness = createContentHarnessWithStorage(storage);
+  await settle();
+  assert.match(
+    harness.sandbox.__XTCE_content.getLastError().message,
+    /storage read failed/
+  );
+  // The route poll also retries a transient restore failure.
+  harness.intervals[0].fn();
+  await settle();
+  assert.equal(harness.sandbox.__XTCE_content.getState().count, 1);
+  assert.equal(harness.sandbox.__XTCE_content.getLastError(), null);
+  harness.emit('message', tweetMessage([makeRecord(91)]));
+  await settle();
+  await harness.sandbox.__XTCE_content.flush();
+  assert.deepEqual(
+    idsOf(harness.storage.data.get('xtce_alice').records).sort(),
+    ['90', '91']
+  );
+  assert.equal(harness.sandbox.__XTCE_content.getLastError(), null);
+});
+
+/* -------------------------------------------------------------------------
+ * Two-world ordering and attribution regressions (review items 1 and 2)
+ * ---------------------------------------------------------------------- */
+
+await test('early timeline batches are replayed when the collector loads later', async () => {
+  let call = 0;
+  const harness = createTwoWorldHarness({
+    fetch: () => {
+      call += 1;
+      const payload =
+        call === 1
+          ? makeInterceptFixture('alice', '1001')
+          : makeInterceptFixture('alice', '1002');
+      return Promise.resolve(makeResponse(payload));
+    }
+  });
+  harness.loadInterceptor();
+  await harness.main.fetch('https://x.com/i/api/graphql/abc/UserTweets');
+  await harness.main.fetch(
+    'https://x.com/i/api/graphql/abc/UserTweetsAndReplies'
+  );
+  await harness.settle();
+  assert.equal(
+    harness.tweetMessages().length,
+    0,
+    'the interceptor must buffer while the collector is absent'
+  );
+
+  harness.loadCollector();
+  await harness.settle();
+  await harness.settle();
+  const state = harness.isolated.__XTCE_content.getState();
+  assert.equal(state.username, 'alice');
+  assert.equal(state.count, 2);
+  assert.deepEqual(idsOf(state.records), ['1001', '1002']);
+  await harness.isolated.__XTCE_content.flush();
+  assert.equal(harness.storage.data.get('xtce_alice').records.length, 2);
+});
+
+await test('collector-first startup still receives a later interceptor batch', async () => {
+  const harness = createTwoWorldHarness();
+  harness.loadCollector();
+  await harness.settle();
+  harness.loadInterceptor();
+  await harness.settle();
+  await harness.main.fetch('https://x.com/i/api/graphql/abc/UserTweets');
+  await harness.settle();
+  const state = harness.isolated.__XTCE_content.getState();
+  assert.equal(state.username, 'alice');
+  assert.equal(state.count, 1);
+});
+
+await test('a delayed Alice response after navigating to Bob stays in the Alice bucket', async () => {
+  let release;
+  const pending = new Promise((resolve) => {
+    release = resolve;
+  });
+  const harness = createTwoWorldHarness({ fetch: () => pending });
+  harness.loadCollector();
+  harness.loadInterceptor();
+  await harness.settle();
+
+  const response = harness.main.fetch(
+    'https://x.com/i/api/graphql/abc/UserTweets'
+  );
+  await harness.settle();
+  harness.navigate('/bob', '');
+  // Deliberately do not run the 500 ms poll: the collector must use the
+  // request-time route, not the route that is current at receipt.
+  release(makeResponse(interceptFixture));
+  await response;
+  await harness.settle();
+  await harness.isolated.__XTCE_content.flush();
+
+  const alice = harness.storage.data.get('xtce_alice');
+  assert.ok(alice, 'the Alice bucket must exist');
+  assert.deepEqual(idsOf(alice.records), ['1001']);
+  assert.equal(
+    harness.storage.data.has('xtce_bob'),
+    false,
+    'Bob must not be polluted by a late Alice response'
+  );
+  assert.equal(
+    harness.isolated.__XTCE_content.getState().username,
+    'bob',
+    'the live route is synced without waiting for the poll'
+  );
+});
+
+await test('a response right after pushState lands in the new bucket', async () => {
+  const harness = createTwoWorldHarness({
+    pathname: '/alice',
+    initialStorage: {
+      xtce_bob: {
+        version: 1,
+        username: 'bob',
+        records: [makeRecord(20, { author_username: 'bob' })]
+      }
+    },
+    fetch: () => Promise.resolve(makeResponse(bobInterceptFixture))
+  });
+  harness.loadCollector();
+  harness.loadInterceptor();
+  await harness.settle();
+  assert.equal(harness.isolated.__XTCE_content.getUsername(), 'alice');
+
+  harness.navigate('/bob', '');
+  // No interval call: the collector must catch up from the message itself.
+  await harness.main.fetch('https://x.com/i/api/graphql/abc/UserTweets');
+  await harness.settle();
+  const state = harness.isolated.__XTCE_content.getState();
+  assert.equal(state.username, 'bob');
+  assert.equal(state.count, 2);
+  assert.deepEqual(idsOf(state.records).sort(), ['20', '2001']);
+
+  await harness.isolated.__XTCE_content.flush();
+  assert.equal(harness.storage.data.get('xtce_bob').records.length, 2);
+  assert.equal(harness.storage.data.has('xtce_alice'), false);
 });
 
 /* ------------------------------------------------------------------------- */

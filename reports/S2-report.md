@@ -1,5 +1,11 @@
 # S2 Report — Interceptor + collector
 
+> Review follow-up: the five change requests on `d16483a` (early-response
+> ordering, request-time attribution/author filtering, restore-vs-mutation
+> serialization, two-tab merge, and storage error propagation) are implemented
+> and documented in [`reports/S2-review-fixes.md`](S2-review-fixes.md). The
+> sections below describe the original S2 slice and are kept for history.
+
 - Worker: dsh (DeepSeek V4.1 Flash), dispatched by the Orca coordinator.
 - Repo: norinori1/X-tweet-csv-exporter (this worktree).
 - Worktree/branch: `C:\Users\Takumi\orca\workspaces\X-tweet-csv-exporter\xtce-s2-new`,
