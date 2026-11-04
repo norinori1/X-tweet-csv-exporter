@@ -1,89 +1,151 @@
 # X Tweet CSV Exporter (Local)
 
-ある人物のXの公開ツイートを、完全ローカルでCSV/JSONにエクスポートするChrome拡張（個人用・無料・APIキー不要）。
+ある人物の X（Twitter）の公開ツイートを、**完全ローカル**で CSV / JSON にエクスポートする Chrome 拡張（Manifest V3）です。API キー不要、外部サーバーなし、アカウント登録なし。
 
-**Status: S2 (collector)** — MV3 の雛形、GraphQL パーサー、MAIN world の fetch/XHR インターセプター、プロフィール単位の収集・保存まで実装済みです。1 回目のレビュー指摘（早期レスポンスの取りこぼし、レスポンスの帰属、復元と書込みの競合、複数タブ、quota エラー）、2 回目のレビュー指摘（クロスタブの clear 伝播・復活、x.com / twitter.com 間の書込み競合）、3 回目のレビュー指摘（ライターリースの TTL は fencing token にならないこと、in-flight `chrome.storage.set` を read-before-set で fence できないこと、`navigator.locks` 不在時の暗黙の直列化解除）も反映済みです。保存の read-modify-write は MV3 service worker の単一コーディネーターがユーザー単位のキューで直列化します。UI・CSV/JSON ダウンロードは S3 で追加します。
+**Status: S3（実装完了・実機確認待ち）** — パーサー、タイムライン収集、フローティングパネル、CSV / JSON ダウンロード、README まで実装済みです。自動テスト（S1 + S2 + S3）はすべて PASS。**実機の X での動作確認はまだ行っていません**（テストは合成フィクスチャのみ）。オーナーによる実機確認待ちです。
+
+## できること
+
+- プロフィールのタイムライン（ツイート / 返信 / メディア）と検索結果を、スクロールに追従して自動収集。
+- 右下のパネルからワンクリックで CSV / JSON をダウンロード。
+- CSV は Excel で文字化けしない **UTF-8 BOM 付き**、固定 27 列、`created_at_iso` 昇順。
+- データは `chrome.storage.local` にだけ保存。外部への送信・解析・テレメトリーは一切ありません。
+
+## インストール
+
+1. Chrome で `chrome://extensions` を開きます。
+2. 右上の「デベロッパーモード」をオンにします。
+3. 「パッケージ化されていない拡張機能を読み込む」を押し、このリポジトリのフォルダ（`manifest.json` がある階層）を選びます。
+4. ツールバーの拡張アイコンをピン留めすると、使い方のポップアップを開けます。
+
+x.com にログインした状態で使ってください。権限は `storage` と `https://x.com/*` / `https://twitter.com/*` のホスト権限だけです。
+
+## 使い方
+
+### 1. プロフィールのツイートを収集する
+
+1. `https://x.com/<ユーザー名>` を開きます。
+2. 右下のパネルに現在の `@ユーザー名` と取得件数が表示されます。
+3. **「自動スクロール開始」** を押すと、約 1.8 秒ごとにページ最下部へスクロールし、X が追加読み込みしたツイートを取り込みます。
+4. 取得件数が増えなくなったら **「停止」** を押します（自動でも止まります。下記）。
+5. **「CSV ダウンロード」** または **「JSON ダウンロード」** を押します。
+
+手動でスクロールしても収集されます。自動スクロール中に手動で動かしてもかまいません。
+
+### 2. 返信も含める
+
+プロフィールの「返信」タブ（`https://x.com/<ユーザー名>/with_replies`）を開いてから、同じ手順で収集します。返信タブで取得した分は同じユーザーのバケットにマージされます。
+
+### 3. 古い投稿を深く掘る（検索ページ）
+
+X のタイムラインは過去すべてを返すわけではありません。古い投稿は検索ページで期間を区切って収集します。
+
+1. `https://x.com/search?q=from%3A<ユーザー名>%20since%3A2020-01-01%20until%3A2021-01-01&f=live` を開く（検索欄に `from:<ユーザー名> since:2020-01-01 until:2021-01-01` と入力して「最新」でも可）。`since:` はその日を含み、`until:` はその日を含みません。上の例は 2020-01-01〜2020-12-31 を対象にします。
+2. 検索結果のページでもパネルは使えます。収集結果は `xtce_<ユーザー名>` バケットにマージされます。
+3. 期間をずらして繰り返すと、タイムラインで取り切れなかった投稿を補えます。
+
+### 4. パネルの操作
+
+| ボタン | 動作 |
+| --- | --- |
+| 自動スクロール開始 | 約 1.8 秒間隔で最下部へスクロール。件数が 6 回連続で増えないと間隔を 5 秒に落として再試行し、さらに 3 回増えなければ「タイムラインの末尾、またはレート制限の可能性があります」と表示して停止します |
+| 停止 | 自動スクロールを止めます（手動スクロールでの収集は継続） |
+| CSV ダウンロード | `created_at_iso` 昇順の CSV を保存 |
+| JSON ダウンロード | 同じ順序の JSON 配列を保存 |
+| クリア | 現在のユーザーのメモリと `chrome.storage.local` のバケットを空にします（確認ダイアログなし。完了後に「クリアしました」と表示） |
+| 折りたたみ（▾ / ▸） | パネルを畳んでページの表示を邪魔しないようにします |
+
+パネルは右下の固定ボックスだけで、ページの他の場所のクリックを遮りません。プロフィール以外のページでは「自動スクロール開始」は無効になります。
+
+## 出力ファイル
+
+ファイル名は `tweets_<ユーザー名>_<yyyy-mm-dd-hhmmss>.csv` / `.json`（端末のローカル時刻）です。
+
+### CSV
+
+- UTF-8（BOM 付き）、CRLF、ヘッダー 1 行 + データ行。
+- 列順は固定です（変更しません）。
+
+```
+id, created_at_iso, text, url, author_username, author_name,
+like_count, retweet_count, reply_count, quote_count, bookmark_count,
+view_count, hashtags, mentions, urls, media_urls, media_types,
+is_reply, in_reply_to_status_id, in_reply_to_username,
+is_retweet, retweeted_status_id, is_quote, quoted_status_id,
+conversation_id, lang, source
+```
+
+- `created_at_iso` は UTC の ISO 8601。並び順はこの列の昇順です。
+- 複数値（`hashtags` / `mentions` / `urls` / `media_urls` / `media_types`）は空白区切り。
+- 真偽値は `true` / `false`。`source` は HTML タグを除いたアプリ名。
+- カンマ・ダブルクォート・改行を含む値は RFC 4180 形式でクォートします。
+- 長文は `note_tweet` の全文を優先します。リツイート / 引用元は別レコードにせず、`retweeted_status_id` / `quoted_status_id` だけを記録します。
+
+### JSON
+
+`created_at_iso` 昇順のレコード配列です（UTF-8、BOM なし、2 スペース整形）。
+
+## データの保存場所とプライバシー
+
+- 収集データのスナップショットは `chrome.storage.local` の `xtce_<ユーザー名>` キーに保存します（`{version, username, updatedAt, clearEpoch, records}`）。
+- 書込みは write-ahead journal 方式です。commit 中は、次に書く完全なスナップショットの複製を `xtce:wal:<ユーザー名>` キーにも一時保存し、スナップショットの書込み後に journal を削除します。commit が中断した場合は、次回の service worker 起動時の修復まで journal が残ります。そのため commit 中は同じデータが 2 つのキーに存在し、`chrome.storage.local` の実効容量は約 10 MB を大きく下回ることがあります。
+- 拡張は x.com 自身が行う GraphQL リクエストの**レスポンスを読むだけ**で、拡張から外部ネットワークへリクエストを送りません。解析・テレメトリー・リモート設定・API キーはありません。
+- 保存の read-modify-write は MV3 の service worker（`src/background.js` + `src/coordinator.js`）がユーザー単位のキューで直列化する設計です。複数タブや x.com / twitter.com の混在でも同じキューを使う設計ですが、これは合成テスト（fake storage / fake tab）でのみ検証しており、実 Chrome の複数タブ同時操作では未検証です（オーナー実機確認待ち）。
+- クリアは `clearEpoch` を進めて空のスナップショットを書く設計で、別タブの古いスナップショットが後から復活しないことを合成テストで確認しています。実 Chrome のタブ間タイミングでの clear 伝播は未検証です。
+- service worker が commit 中に中断した場合、次回起動時に `xtce:wal:<ユーザー名>` からスナップショットを修復する設計です。この修復の順序は、`chrome.storage.local` のバックエンドが発行順に操作を適用するという前提に依存しており、無条件の保証ではありません。実 Chrome での worker eviction / 復旧も未検証です（合成テストのみ）。
+- 失敗時は fail closed で、直接 storage に書くフォールバックはありません。
+- 拡張を削除するか Chrome の拡張機能データを消すと、保存データも削除されます。
 
 ## 構成
 
 | File | Role |
 | --- | --- |
-| `manifest.json` | Manifest V3。権限は `storage` と x.com / twitter.com のホスト権限のみ。MAIN / ISOLATED とも `document_start`。`src/background.js` を service worker として登録 |
-| `src/parser.js` | X の GraphQL レスポンスから CSV レコードを作る純粋関数（DOM/通信なし） |
-| `src/interceptor.js` | MAIN world。`fetch` / XHR をフックし、リクエスト時点のルートを付けて `XTCE_TWEETS` を postMessage。collector の READY までバッファ |
-| `src/coordinator.js` | 保存の唯一の authority。ユーザー単位の promise キューで read-modify-write を直列化し、clearEpoch の判定、write-ahead journal（`xtce:wal:<user>`）による中断復旧、不正 payload の fail-closed 検証を行う。service worker とテストからのみ読み込む |
-| `src/background.js` | MV3 service worker。`chrome.runtime.onMessage` で content script の `XTCE_COORDINATE` を受け、`src/coordinator.js` に渡す。commit が完了するまで応答せず、起動時に journal を修復する |
-| `src/store.js` | 純粋なユーザー別ストア（id 重複排除、SPA 切替、500ms スロットル保存、復元の直列化、clearEpoch による clear 伝播、エラー保持・リトライ）。永続化は coordinator に委譲し、直接 storage を書かない |
-| `src/content.js` | ISOLATED world。document_start で待受・READY ハンドシェイク、リクエスト時ルートへの帰属、author フィルタ、service worker への coordinator RPC（timeout / lastError を surface）、onChanged の clear 反映、S3 用 API |
-| `tests/parser.test.mjs` | 合成フィクスチャによる Node テスト（S1） |
-| `tests/collector.test.mjs` | fetch/XHR・store・content 配線・順序/帰属/永続化/clear 伝播/coordinator の直列化・journal 復旧・fail-closed の Node テスト（S2） |
-| `reports/S1-report.md` / `reports/S2-report.md` / `reports/S2-review-fixes.md` / `reports/S2-review-fixes-2.md` / `reports/S2-review-fixes-3.md` | 各スライスとレビュー対応の作業レポート |
-
-## 収集の仕組み
-
-1. MAIN / ISOLATED とも `document_start` で起動します。MAIN world の `src/interceptor.js` が `fetch` と `XMLHttpRequest` をフックし、ISOLATED world の `src/content.js` はメッセージリスナーを設置して `XTCE_COLLECTOR_READY` を送ります。どちらの world が先に起動しても、interceptor は READY を受け取るまでバッチを保持して後から再生します（最大 50 バッチ）。
-2. 対象は x.com 自身の `/i/api/graphql/`（または `/i/api/2/`）で、UserTweets など既定のタイムライン操作のみです。拡張自身はリクエストを作りません。レスポンスの JSON を `window.__XTCE_parse.extractFromGraphQL` に渡し、空でなければ `{type:"XTCE_TWEETS", tweets, source:{pathname, search, operation}}` を送ります。`source` はリクエスト開始時点のルートです。
-3. collector は `source` からリクエスト時のバケットを決めます（`/alice` の first segment、または `/search?q=from:alice`）。遅れて届いた Alice のレスポンスが Bob のバケットに入ることはありません。pushState 直後でも、メッセージ受信時に現在のルートへ即座に追従するため、500ms ポーリングを待たずに新しいバケットへ入ります。
-4. 保存するのは `author_username` がリクエスト時のバケットと一致するレコードだけです。TweetDetail の他人の返信や Likes の他人のツイートは、人物のエクスポートを汚さないよう破棄します。
-5. 変更は MV3 service worker（`src/background.js`）に `XTCE_COORDINATE` として送り、`src/coordinator.js` が `chrome.storage.local` の `xtce_<username>` に約 500ms スロットルで保存します。content script は snapshot を直接書きません。coordinator はユーザー単位の promise キューを持ち、x.com / twitter.com / 全タブの read-modify-write を同じキューで直列化します（Chrome は extension ごとに service worker を 1 つ実行します）。`navigator.locks` は origin 単位で両ドメインを直列化できないため使用しません。queue は TTL で失効せず、先行する commit が完了するまで次の commit は storage を読みません。
-6. 保存形式は `{version: 2, username, updatedAt, clearEpoch, records: [...]}` です。clear は `clearEpoch` を 1 つ進めて `records: []` を書きます。別タブは onChanged で空の snapshot を受け取っても無視せず、新しい epoch ならメモリを空にします。onChanged を取りこぼした stale タブでも、次の commit が coordinator 側で storage の epoch を読み直し、古い snapshot を書き戻しません。commit 中に新しい clear を観測した場合は、その commit の応答をメモリに merge せず、採用済みの状態で storage を修復します。キー削除（`chrome.storage.local.remove` / `clear`）も clear として扱います。
-7. coordinator は commit の前に `xtce:wal:<username>` へ「次に書く完全な payload」を journal として書き、snapshot を書き、最後に journal を消します。service worker が eviction などで snapshot 書込み中に落ちても、次の worker が journal から snapshot を修復してからそのユーザーの要求を処理します。journal は TTL 付きリースではなく、最後に commit しようとした payload そのものです。service worker は commit が終わるまで `sendResponse` を呼ばず、`onMessage` から `true` を返して message channel を開いたままにします。worker が応答前に消えた場合、content script は `XTCE_COORDINATION_TIMEOUT` / `XTCE_COORDINATION_UNAVAILABLE` で失敗し、dirty のまま指数バックオフで再試行します（commit は id 和集合と clearEpoch により冪等）。
-8. coordinator に到達できない、storage の payload / journal が読めない、要求が不正、という場合は **fail closed** です。snapshot を直接書く fallback も、`navigator.locks` だけに頼る fallback もありません。`chrome.runtime.lastError` は握りつぶさず reject に変換し、失敗したバケットは dirty のまま保持して指数バックオフで再試行し、`getState().error` / `getLastError()` で S3 に通知します。quota エラーは code なし、coordinator の失敗は `XTCE_COORDINATION_UNAVAILABLE` / `XTCE_COORDINATION_TIMEOUT`、不正データは `XTCE_STORAGE_CORRUPT` / `XTCE_WAL_CORRUPT`、不正要求は `XTCE_COORDINATION_PROTOCOL` です。
-
-## S3 向け API
-
-ISOLATED world の `globalThis.__XTCE_content` に以下を公開しています。S3 は同じ `src/content.js` に実装されるため、モジュール内から直接呼ぶこともできます。
-
-- `getState()` — `{ username, count, records, error }`。`records` は追加順（CSV 化の際は `created_at_iso` 昇順にソートする）。`error` は `{message, operation, username, at, code}` または `null`
-- `getUsername()` — 現在のバケット名（`getState()` より軽い）
-- `subscribe(fn)` — 変更時に `fn(state)` を呼ぶ。戻り値は解除関数
-- `clearCurrent()` — 現在のユーザーのメモリと保存バケットを空にする。coordinator / storage の失敗で reject
-- `flush()` — 保留中の保存を即時実行する。coordinator / storage の失敗で reject
-- `getLastError()` — 直近の storage エラー（なければ `null`）。`code` は `XTCE_COORDINATION_UNAVAILABLE` / `XTCE_COORDINATION_TIMEOUT` / `XTCE_STORAGE_CORRUPT` / `XTCE_WAL_CORRUPT` / `XTCE_COORDINATION_PROTOCOL` を取り得る。quota など storage 自体の失敗は code なし
-- `clearError()` — 表示用のエラーを消す
-
-S3 の UI は `document_start` で読み込まれるため、DOM の構築を待ってからパネルを描画してください（`DOMContentLoaded` 以降）。
-
-## パーサー API
-
-`window.__XTCE_parse`（MAIN world）に以下を公開します。Node の `vm` でも読み込めます。
-
-- `extractFromGraphQL(payload)` — payload 内の全 `tweet_results.result` をレコード配列に変換
-- `extractTweetResult(result)` — 1 件をレコードに変換（tombstone は `null`）
-- `toCSV(records)` — UTF-8 BOM 付き CSV 文字列（ヘッダーは固定順、CRLF）
-- `CSV_COLUMNS` — 固定カラム順の配列
-
-### 変換メモ
-
-- 長文は `note_tweet.note_tweet_results.result.text` とその `entity_set` を優先。
-- リツイートは `is_retweet=true` と `retweeted_status_id` のみ。埋め込まれた元ツイートは別レコードにしません。
-- 引用も同様に `quoted_status_id` のみで、引用元は別レコードにしません。
-- メディアは写真 = `media_url_https`、動画/GIF = 最高ビットレートの `video/mp4`。
-- 複数値（hashtags / mentions / urls / media_urls / media_types）は空白区切り。
-- 真偽値は `true` / `false`。`source` は HTML タグを除いたアプリ名。
-- `created_at_iso` は UTC の ISO 8601。
+| `manifest.json` | Manifest V3。権限は `storage` と x.com / twitter.com のホスト権限のみ。MAIN / ISOLATED とも `document_start`。`src/background.js` を service worker、`popup.html` を action popup として登録 |
+| `src/csv.js` | CSV の唯一の実装。固定列順・RFC 4180 エスケープ・UTF-8 BOM・CRLF。MAIN（parser）と ISOLATED（panel）の両方から使う |
+| `src/parser.js` | X の GraphQL レスポンスから CSV レコードを作る純粋関数（DOM / 通信なし）。CSV 生成は `src/csv.js` に委譲 |
+| `src/interceptor.js` | MAIN world。`fetch` / XHR をフックし、対象の GraphQL レスポンスを `XTCE_TWEETS` として ISOLATED world に postMessage。collector の READY までバッファ |
+| `src/coordinator.js` | 保存の唯一の authority。ユーザー単位キュー、clearEpoch、write-ahead journal、fail-closed 検証 |
+| `src/background.js` | MV3 service worker。content script からの `XTCE_COORDINATE` を coordinator に渡し、commit 完了まで応答を待つ |
+| `src/store.js` | 純粋なユーザー別ストア（id 重複排除、SPA 切替、500 ms スロットル保存、復元、clear 伝播、エラー保持・リトライ） |
+| `src/content.js` | ISOLATED world の collector。メッセージ受信、リクエスト時ルートへの帰属、author フィルタ、coordinator RPC、S3 向け `globalThis.__XTCE_content` API |
+| `src/panel.js` | S3 のフローティングパネル。状態表示、自動スクロール（停止検出）、CSV / JSON ダウンロード、クリア |
+| `src/panel.css` | パネルのダークテーマ。`#xtce-panel` 配下にスコープし、ページのクリックを遮らない |
+| `popup.html` | 拡張アイコンの短い使い方（プロフィール → 開始 → ダウンロード、すべてローカル） |
+| `tests/parser.test.mjs` | S1 のパーサー / CSV テスト（合成 GraphQL フィクスチャ） |
+| `tests/collector.test.mjs` | S2 の interceptor / store / content / coordinator テスト（fake fetch / XHR / storage / clock） |
+| `tests/panel.test.mjs` | S3 のパネル / 自動スクロール / ダウンロード / clear テスト（fake DOM / clock） |
+| `reports/` | 各スライスとレビュー対応の作業レポート |
 
 ## テスト
+
+Node.js 18+（実行環境: v24.15.0）。依存パッケージのインストールは不要です。
 
 ```sh
 node tests/parser.test.mjs
 node tests/collector.test.mjs
+node tests/panel.test.mjs
 ```
 
-Node.js 18+ 想定（実行環境: v24.15.0）。依存パッケージのインストールは不要です。
+すべて PASS で終了コード 0 です（S3 時点: 10 / 74 / 18 テストグループ）。テストはすべて合成データで、実機の X やネットワークにはアクセスしません。
 
-## 既知の制限（S2 時点）
+## 既知の制限
 
-- 実機の X での動作確認は未実施（合成フィクスチャと fake fetch/XHR のみ）。
-- UI・CSV/JSON ダウンロードは未実装（S3）。
-- プロフィール・検索（`from:user`）以外のページ（home / explore / bookmarks など）では保存先ユーザーを決められないため、受信したバッチは破棄します。
-- `author_username` がリクエスト時のバケットと一致しないレコードは破棄します。この保守的なフィルタにより、`TweetDetail` の他人の返信や `Likes` の他人のツイートは入りません（Likes は本人のツイートを Like した場合だけ残ります）。Likes を本人のエクスポートに含める仕様にする場合は、S3 で別バケットを定義してください。
-- 保存の read-modify-write は MV3 service worker（`src/background.js` + `src/coordinator.js`）のユーザー単位キューだけで直列化します。`navigator.locks` は使いません。同一 origin の複数タブも x.com / twitter.com の混在も同じキューに入ります。service worker に到達できない、または応答が timeout した場合、そのタブは `XTCE_COORDINATION_UNAVAILABLE` / `XTCE_COORDINATION_TIMEOUT` を surface して fail closed し、snapshot を直接書きません。
-- service worker は idle で eviction され得ます。キューはメモリ上にしかありませんが、eviction 時は commit が動いていないか、動いていたなら journal が残っています。新しい worker は `xtce:wal:<user>` から snapshot を修復してからそのユーザーの要求を処理します。journal は TTL 付きリースではなく「最後に commit しようとした完全な payload」で、失効しません。
-- 修復の順序保証は、同一 extension の `chrome.storage.local` がある `set` を、それより後に発行された `set` より先に適用する（storage backend が操作を直列化する）という前提に依存します。この前提が破れると、eviction 前の in-flight `set` が修復後に着地し得ます。その場合でも journal が残っている間は read が journal を優先しますが、journal 削除後の巻き戻りまでは検出できません。これは TTL やリースではなく、単一 writer + durable journal + storage の操作順序による保証です。
-- commit が中断されると、元のタブにはエラーが見えますが、journal が後から修復されて commit されることがあります。これはデータを失わないための意図的な挙動で、再試行は id 和集合と clearEpoch により冪等です。
-- 1 回の commit はユーザーの全 in-memory snapshot を service worker に送り、`chrome.storage.local` に書きます。数千件規模では message / storage のサイズに注意が必要です。quota エラーは S3 に通知し、dirty のまま再試行しますが、空きができるまで storage には反映されません。
-- clear は「clear を観測する前に受信したレコード」に対して優先します。clear コミット直後〜他タブが onChanged を処理するまでの極小ウィンドウで受信した新規レコードは、復活を防ぐため破棄されることがあります。
-- 別タブの `clearCurrent` は、他タブの未保存レコードも含めて削除します（clearEpoch の伝播）。ただし上記ウィンドウのレコードは保存されない場合があります。
-- interceptor のバッファは最大 50 バッチです。collector がまったく起動しない異常時は古いバッチから捨てます。
-- 実際の GraphQL ペイロード形状は変更されうるため、実データでの確認は未実施です。
+- **「全件」は X のタイムラインが返す範囲**です。プロフィールのタイムラインは過去すべてを返さないため、古い投稿は検索の `from: since: until:` で期間を区切って補ってください（`until:` は排他的で、その日を含みません。終了日を含めたい場合は翌日を指定します）。
+- 実機の X での動作確認は未実施です。合成フィクスチャと fake fetch / XHR / storage のみで検証しています。特に write-ahead journal による復旧、service worker の再起動、複数タブ間の直列化 / clear 伝播は合成テストだけであり、実 Chrome では未検証です（オーナー実機確認がゲート）。実データの GraphQL 形状は変更されうるため、パースできない場合は `src/parser.js` の更新が必要です。
+- レート制限や X 側の応答停止で新しいツイートが返らなくなると、自動スクロールの停止検出（6 回 + 低速 3 回）が働いて止まります。これは「タイムラインの末尾」と「レート制限」を区別しません。時間を置いて再開してください。
+- 保護アカウントは、ログイン中のオーナーが見られる範囲だけ収集できます。非公開の投稿は取得できません。
+- プロフィール / 検索（`from:user`）以外のページ（home / explore / bookmarks など）では保存先ユーザーを決められないため、受信バッチは破棄されます。
+- `author_username` がリクエスト時のバケットと一致しないレコードは破棄します（TweetDetail の他人の返信や、Likes の他人のツイートを混ぜないため）。
+- 返信タブ / メディアタブで収集した内容は同じユーザーのバケットにマージされます。タイムラインで取得済みの投稿は id で重複排除されます。
+- `chrome.storage.local` の quota は約 10 MB です。commit 中はスナップショットの完全な複製が write-ahead journal（`xtce:wal:<ユーザー名>`）にもう 1 つ存在するため、実効容量は 10 MB を大きく下回ることがあります。quota エラーはパネルのステータスに表示され、空きができるまで storage への反映を再試行します（メモリ上のデータは保持）。数千件規模では注意してください。
+- クリアは現在のユーザーのバケットだけを対象にします。別タブの未保存レコードも clearEpoch で削除される設計ですが（合成テストで確認、実 Chrome のタブ間タイミングでは未検証）、clear 直後の極小ウィンドウで受信したレコードは復活防止のため保存されないことがあります。
+- write-ahead journal の修復順序は、`chrome.storage.local` のバックエンドが発行順に操作を適用するという前提に依存しており、無条件の保証ではありません。
+- パネルは `document_start` で読み込まれ、`DOMContentLoaded` 後に描画されます。X のページ構造や CSS が大きく変わると、パネルの見た目に影響する可能性があります。
+- 自動スクロールはウィンドウスクロールを前提にしています。X がスクロールコンテナを変更した場合は、手動スクロールでの収集に切り替えてください。
+
+## 開発メモ
+
+- 追加の権限、ビルド工程、外部依存はありません。`manifest.json` を読み込むだけで動きます。
+- S3 のパネルは S2 の `globalThis.__XTCE_content` API だけを使い、`chrome.storage.local` を直接読み書きしません。
+- CSV の列順・エスケープ・BOM を変えるときは `src/csv.js` と `tests/parser.test.mjs` / `tests/panel.test.mjs` をセットで更新してください（parser と panel が同じ実装を共有しています）。
+- 実機確認の観点: プロフィールで件数が増えるか、返信タブ・検索でも収集できるか、CSV が Excel で文字化けしないか、クリア後に再読込しても復活しないか、別タブと同時に使っても壊れないか。

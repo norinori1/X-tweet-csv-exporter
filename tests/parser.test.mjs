@@ -11,13 +11,17 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
+const csvSource = readFileSync(new URL('../src/csv.js', import.meta.url), 'utf8');
 const parserSource = readFileSync(new URL('../src/parser.js', import.meta.url), 'utf8');
 const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url), 'utf8'));
 
 const sandbox = { window: {}, console };
 vm.createContext(sandbox);
+vm.runInContext(csvSource, sandbox, { filename: 'src/csv.js' });
 vm.runInContext(parserSource, sandbox, { filename: 'src/parser.js' });
 
+const csvApi = sandbox.__XTCE_csv;
+assert.ok(csvApi, 'src/csv.js must expose the shared CSV builder');
 const api = sandbox.window.__XTCE_parse;
 assert.ok(api, 'src/parser.js must expose window.__XTCE_parse in a vm context');
 const { extractFromGraphQL, extractTweetResult, toCSV, CSV_COLUMNS } = api;
@@ -314,6 +318,14 @@ test('parser loads in vm and exposes the frozen API', () => {
   assert.deepEqual([...CSV_COLUMNS], EXPECTED_COLUMNS);
 });
 
+test('parser delegates CSV serialization to the shared src/csv.js', () => {
+  assert.equal(typeof csvApi.toCSV, 'function');
+  assert.equal(csvApi.toCSV, toCSV, 'one CSV builder must not diverge');
+  assert.equal(csvApi.CSV_COLUMNS, CSV_COLUMNS);
+  assert.deepEqual([...csvApi.CSV_COLUMNS], EXPECTED_COLUMNS);
+  assert.equal(csvApi.csvEscape('a,b'), '"a,b"');
+});
+
 test('walks the timeline and skips tombstone and cursor entries', () => {
   assert.equal(records.length, 4);
   assert.deepEqual(
@@ -437,7 +449,7 @@ test('toCSV writes BOM, frozen header, CRLF rows and RFC escaping', () => {
   assert.equal(toCSV([]), '\uFEFF' + EXPECTED_HEADER + '\r\n');
 });
 
-test('manifest keeps the frozen permissions and the S2 content-script wiring', () => {
+test('manifest keeps the frozen permissions and the S3 content-script wiring', () => {
   assert.equal(manifest.manifest_version, 3);
   assert.equal(manifest.name, 'X Tweet CSV Exporter (Local)');
   assert.equal(manifest.version, '0.1.0');
@@ -453,20 +465,31 @@ test('manifest keeps the frozen permissions and the S2 content-script wiring', (
     'the coordinator worker must stay a classic worker so importScripts works'
   );
   assert.equal(manifest.content_scripts.length, 2);
-  assert.deepEqual(manifest.content_scripts[0].js, ['src/parser.js', 'src/interceptor.js']);
+  assert.deepEqual(manifest.content_scripts[0].js, [
+    'src/csv.js',
+    'src/parser.js',
+    'src/interceptor.js'
+  ]);
   assert.deepEqual(manifest.content_scripts[0].matches, [
     'https://x.com/*',
     'https://twitter.com/*'
   ]);
   assert.equal(manifest.content_scripts[0].world, 'MAIN');
   assert.equal(manifest.content_scripts[0].run_at, 'document_start');
-  assert.deepEqual(manifest.content_scripts[1].js, ['src/store.js', 'src/content.js']);
+  assert.deepEqual(manifest.content_scripts[1].js, [
+    'src/csv.js',
+    'src/store.js',
+    'src/content.js',
+    'src/panel.js'
+  ]);
+  assert.deepEqual(manifest.content_scripts[1].css, ['src/panel.css']);
   assert.deepEqual(manifest.content_scripts[1].matches, [
     'https://x.com/*',
     'https://twitter.com/*'
   ]);
   assert.equal(manifest.content_scripts[1].world, 'ISOLATED');
   assert.equal(manifest.content_scripts[1].run_at, 'document_start');
+  assert.equal(manifest.action.default_popup, 'popup.html');
 
   const serialized = JSON.stringify(manifest);
   assert.ok(!serialized.includes('webRequest'));

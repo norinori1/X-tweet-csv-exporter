@@ -1,0 +1,195 @@
+/*
+ * X Tweet CSV Exporter (Local) — S3 panel styles.
+ *
+ * Registered as a content_scripts CSS file in manifest.json, so it applies to
+ * x.com / twitter.com. Everything is scoped under #xtce-panel: the fixed box
+ * only covers the panel itself, so clicks elsewhere on the page are untouched.
+ */
+
+#xtce-panel,
+#xtce-panel * {
+  box-sizing: border-box;
+}
+
+#xtce-panel {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 2147483647;
+  width: 300px;
+  max-width: calc(100vw - 32px);
+  margin: 0;
+  padding: 0;
+  background: #000000;
+  color: #e7e9ea;
+  border: 1px solid #2f3336;
+  border-radius: 16px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans",
+    "Yu Gothic UI", Meiryo, sans-serif;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.45;
+  text-align: left;
+  letter-spacing: normal;
+  pointer-events: auto;
+}
+
+#xtce-panel .xtce-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid #2f3336;
+}
+
+#xtce-panel .xtce-title {
+  color: #e7e9ea;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#xtce-panel .xtce-collapse {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  margin: 0;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #2f3336;
+  border-radius: 999px;
+  background: transparent;
+  color: #e7e9ea;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+#xtce-panel .xtce-collapse:hover {
+  background: #16181c;
+}
+
+#xtce-panel .xtce-body {
+  padding: 10px 12px 12px;
+}
+
+#xtce-panel .xtce-body[hidden] {
+  display: none !important;
+}
+
+#xtce-panel .xtce-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+#xtce-panel .xtce-label {
+  color: #8b98a5;
+  font-size: 12px;
+}
+
+#xtce-panel .xtce-value {
+  color: #e7e9ea;
+  font-size: 12px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#xtce-panel .xtce-status {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #16181c;
+  color: #8b98a5;
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+#xtce-panel .xtce-status[data-tone="info"] {
+  color: #1d9bf0;
+}
+
+#xtce-panel .xtce-status[data-tone="ok"] {
+  color: #00ba7c;
+}
+
+#xtce-panel .xtce-status[data-tone="warn"] {
+  color: #ffd400;
+}
+
+#xtce-panel .xtce-status[data-tone="error"] {
+  color: #f4212e;
+}
+
+#xtce-panel .xtce-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+#xtce-panel .xtce-button {
+  width: 100%;
+  margin: 0;
+  padding: 7px 8px;
+  border: 1px solid #536471;
+  border-radius: 999px;
+  background: transparent;
+  color: #e7e9ea;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  text-align: center;
+  cursor: pointer;
+  appearance: none;
+}
+
+#xtce-panel .xtce-button:hover:not(:disabled) {
+  background: #16181c;
+}
+
+#xtce-panel .xtce-button:focus-visible {
+  outline: 2px solid #1d9bf0;
+  outline-offset: 1px;
+}
+
+#xtce-panel .xtce-button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+#xtce-panel .xtce-button[data-action="csv"],
+#xtce-panel .xtce-button[data-action="json"] {
+  border-color: #1d9bf0;
+  background: #1d9bf0;
+  color: #ffffff;
+}
+
+#xtce-panel .xtce-button[data-action="csv"]:hover:not(:disabled),
+#xtce-panel .xtce-button[data-action="json"]:hover:not(:disabled) {
+  background: #1a8cd8;
+}
+
+#xtce-panel .xtce-button[data-action="clear"] {
+  border-color: #f4212e;
+  color: #f4212e;
+}
+
+#xtce-panel .xtce-button[data-action="clear"]:hover:not(:disabled) {
+  background: rgba(244, 33, 46, 0.1);
+}
