@@ -5,12 +5,21 @@
   "description": "Export your public X posts to CSV locally. No server, no account, no API key.",
   "permissions": ["storage"],
   "host_permissions": ["https://x.com/*", "https://twitter.com/*"],
+  "background": {
+    "service_worker": "src/background.js"
+  },
   "content_scripts": [
     {
       "matches": ["https://x.com/*", "https://twitter.com/*"],
-      "js": ["src/parser.js"],
+      "js": ["src/parser.js", "src/interceptor.js"],
       "run_at": "document_start",
       "world": "MAIN"
+    },
+    {
+      "matches": ["https://x.com/*", "https://twitter.com/*"],
+      "js": ["src/store.js", "src/content.js"],
+      "run_at": "document_start",
+      "world": "ISOLATED"
     }
   ]
 }

@@ -437,7 +437,7 @@ test('toCSV writes BOM, frozen header, CRLF rows and RFC escaping', () => {
   assert.equal(toCSV([]), '\uFEFF' + EXPECTED_HEADER + '\r\n');
 });
 
-test('manifest stays inside the S1 frozen scope', () => {
+test('manifest keeps the frozen permissions and the S2 content-script wiring', () => {
   assert.equal(manifest.manifest_version, 3);
   assert.equal(manifest.name, 'X Tweet CSV Exporter (Local)');
   assert.equal(manifest.version, '0.1.0');
@@ -446,14 +446,27 @@ test('manifest stays inside the S1 frozen scope', () => {
     'https://x.com/*',
     'https://twitter.com/*'
   ]);
-  assert.equal(manifest.content_scripts.length, 1);
-  assert.deepEqual(manifest.content_scripts[0].js, ['src/parser.js']);
+  assert.equal(manifest.background.service_worker, 'src/background.js');
+  assert.equal(
+    manifest.background.type,
+    undefined,
+    'the coordinator worker must stay a classic worker so importScripts works'
+  );
+  assert.equal(manifest.content_scripts.length, 2);
+  assert.deepEqual(manifest.content_scripts[0].js, ['src/parser.js', 'src/interceptor.js']);
   assert.deepEqual(manifest.content_scripts[0].matches, [
     'https://x.com/*',
     'https://twitter.com/*'
   ]);
   assert.equal(manifest.content_scripts[0].world, 'MAIN');
   assert.equal(manifest.content_scripts[0].run_at, 'document_start');
+  assert.deepEqual(manifest.content_scripts[1].js, ['src/store.js', 'src/content.js']);
+  assert.deepEqual(manifest.content_scripts[1].matches, [
+    'https://x.com/*',
+    'https://twitter.com/*'
+  ]);
+  assert.equal(manifest.content_scripts[1].world, 'ISOLATED');
+  assert.equal(manifest.content_scripts[1].run_at, 'document_start');
 
   const serialized = JSON.stringify(manifest);
   assert.ok(!serialized.includes('webRequest'));
