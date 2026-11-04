@@ -11,6 +11,10 @@
  *   toCSV(records)              -> string (UTF-8 BOM + header + CRLF rows)
  *   CSV_COLUMNS                 -> frozen column list
  *
+ * `toCSV` and `CSV_COLUMNS` are the shared implementation from src/csv.js
+ * (loaded first in the MAIN world by manifest.json and by the tests). Keeping
+ * one builder means the panel's download cannot drift from the parser's tests.
+ *
  * Record shape is exactly the frozen CSV column order from the brief.
  * Multi-value columns (hashtags, mentions, urls, media_urls, media_types)
  * are space-joined because those values never contain spaces themselves.
@@ -18,35 +22,21 @@
 (function () {
   'use strict';
 
-  var CSV_COLUMNS = Object.freeze([
-    'id',
-    'created_at_iso',
-    'text',
-    'url',
-    'author_username',
-    'author_name',
-    'like_count',
-    'retweet_count',
-    'reply_count',
-    'quote_count',
-    'bookmark_count',
-    'view_count',
-    'hashtags',
-    'mentions',
-    'urls',
-    'media_urls',
-    'media_types',
-    'is_reply',
-    'in_reply_to_status_id',
-    'in_reply_to_username',
-    'is_retweet',
-    'retweeted_status_id',
-    'is_quote',
-    'quoted_status_id',
-    'conversation_id',
-    'lang',
-    'source'
-  ]);
+  var root =
+    typeof globalThis !== 'undefined'
+      ? globalThis
+      : typeof window !== 'undefined'
+        ? window
+        : null;
+  var csv = root && root.__XTCE_csv;
+  if (!csv || typeof csv.toCSV !== 'function' || !Array.isArray(csv.CSV_COLUMNS)) {
+    throw new Error(
+      'src/parser.js requires src/csv.js to be loaded first ' +
+        '(window.__XTCE_csv is missing).'
+    );
+  }
+  var CSV_COLUMNS = csv.CSV_COLUMNS;
+  var toCSV = csv.toCSV;
 
   var MONTH_INDEX = {
     Jan: 0,
@@ -388,43 +378,6 @@
       }
     }
     return records;
-  }
-
-  /** RFC 4180-style field escaping (quotes, commas, CR, LF). */
-  function csvEscape(value) {
-    if (value === null || value === undefined) {
-      return '';
-    }
-    if (value === true) {
-      return 'true';
-    }
-    if (value === false) {
-      return 'false';
-    }
-    var text = String(value);
-    if (/[",\r\n]/.test(text)) {
-      return '"' + text.replace(/"/g, '""') + '"';
-    }
-    return text;
-  }
-
-  /**
-   * Serialize records as UTF-8-BOM CSV with a CRLF header and rows.
-   * The BOM is the JS character U+FEFF, which the browser writes as
-   * EF BB BF when the string is turned into a UTF-8 Blob.
-   */
-  function toCSV(records) {
-    var lines = [CSV_COLUMNS.join(',')];
-    var list = Array.isArray(records) ? records : [];
-    for (var i = 0; i < list.length; i += 1) {
-      var record = list[i] && typeof list[i] === 'object' ? list[i] : {};
-      var row = [];
-      for (var c = 0; c < CSV_COLUMNS.length; c += 1) {
-        row.push(csvEscape(record[CSV_COLUMNS[c]]));
-      }
-      lines.push(row.join(','));
-    }
-    return '\uFEFF' + lines.join('\r\n') + '\r\n';
   }
 
   var api = {

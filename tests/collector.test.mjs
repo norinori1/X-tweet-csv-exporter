@@ -21,6 +21,7 @@ const backgroundSource = readFileSync(
 );
 const interceptorSource = readFileSync(new URL('../src/interceptor.js', import.meta.url), 'utf8');
 const contentSource = readFileSync(new URL('../src/content.js', import.meta.url), 'utf8');
+const csvSource = readFileSync(new URL('../src/csv.js', import.meta.url), 'utf8');
 const parserSource = readFileSync(new URL('../src/parser.js', import.meta.url), 'utf8');
 const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url), 'utf8'));
 
@@ -755,6 +756,7 @@ function createInterceptorHarness(options) {
   sandbox.window = sandbox;
   vm.createContext(sandbox);
   if (opts.withParser !== false) {
+    vm.runInContext(csvSource, sandbox, { filename: 'src/csv.js' });
     vm.runInContext(parserSource, sandbox, { filename: 'src/parser.js' });
   }
   vm.runInContext(interceptorSource, sandbox, { filename: 'src/interceptor.js' });
@@ -1234,6 +1236,7 @@ function createTwoWorldHarness(options) {
     posted,
     errors,
     loadInterceptor() {
+      vm.runInContext(csvSource, main, { filename: 'src/csv.js' });
       vm.runInContext(parserSource, main, { filename: 'src/parser.js' });
       vm.runInContext(interceptorSource, main, { filename: 'src/interceptor.js' });
     },
@@ -2305,13 +2308,23 @@ await test('manifest wires MAIN interceptor and isolated collector with frozen p
   assert.equal(manifest.content_scripts.length, 2);
 
   const main = manifest.content_scripts[0];
-  assert.deepEqual(main.js, ['src/parser.js', 'src/interceptor.js']);
+  assert.deepEqual(main.js, [
+    'src/csv.js',
+    'src/parser.js',
+    'src/interceptor.js'
+  ]);
   assert.deepEqual(main.matches, ['https://x.com/*', 'https://twitter.com/*']);
   assert.equal(main.world, 'MAIN');
   assert.equal(main.run_at, 'document_start');
 
   const isolated = manifest.content_scripts[1];
-  assert.deepEqual(isolated.js, ['src/store.js', 'src/content.js']);
+  assert.deepEqual(isolated.js, [
+    'src/csv.js',
+    'src/store.js',
+    'src/content.js',
+    'src/panel.js'
+  ]);
+  assert.deepEqual(isolated.css, ['src/panel.css']);
   assert.deepEqual(isolated.matches, ['https://x.com/*', 'https://twitter.com/*']);
   assert.equal(isolated.world, 'ISOLATED');
   assert.equal(
@@ -2319,6 +2332,7 @@ await test('manifest wires MAIN interceptor and isolated collector with frozen p
     'document_start',
     'the collector must listen before early page responses'
   );
+  assert.equal(manifest.action.default_popup, 'popup.html');
 
   const serialized = JSON.stringify(manifest);
   assert.ok(!serialized.includes('webRequest'));
@@ -2327,12 +2341,16 @@ await test('manifest wires MAIN interceptor and isolated collector with frozen p
 
   for (const file of [
     'manifest.json',
+    'popup.html',
+    'src/csv.js',
     'src/parser.js',
     'src/interceptor.js',
     'src/store.js',
     'src/coordinator.js',
     'src/background.js',
-    'src/content.js'
+    'src/content.js',
+    'src/panel.js',
+    'src/panel.css'
   ]) {
     assert.ok(readFileSync(new URL('../' + file, import.meta.url), 'utf8').length > 0, file);
   }

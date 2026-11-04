@@ -8,16 +8,21 @@
   "background": {
     "service_worker": "src/background.js"
   },
+  "action": {
+    "default_title": "X Tweet CSV Exporter (Local)",
+    "default_popup": "popup.html"
+  },
   "content_scripts": [
     {
       "matches": ["https://x.com/*", "https://twitter.com/*"],
-      "js": ["src/parser.js", "src/interceptor.js"],
+      "js": ["src/csv.js", "src/parser.js", "src/interceptor.js"],
       "run_at": "document_start",
       "world": "MAIN"
     },
     {
       "matches": ["https://x.com/*", "https://twitter.com/*"],
-      "js": ["src/store.js", "src/content.js"],
+      "js": ["src/csv.js", "src/store.js", "src/content.js", "src/panel.js"],
+      "css": ["src/panel.css"],
       "run_at": "document_start",
       "world": "ISOLATED"
     }
