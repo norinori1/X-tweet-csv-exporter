@@ -1,5 +1,17 @@
 # S3 Report — Panel UI + export + README
 
+> **S3 review follow-up.** The review found the README overstating storage and
+> durability: it said collected data lives only in `xtce_<user>` although every
+> commit also writes a full copy to `xtce:wal:<user>`, and it did not qualify
+> crash recovery or cross-tab behaviour as synthetic-only. The README now
+> documents the journal copy and its capacity cost, restores the S2-established
+> limitations (journal duplication while committing, surfaced quota failures,
+> and recovery ordering dependent on storage-backend operation ordering), uses
+> the exclusive `until:2021-01-01` boundary for all of 2020, and states that
+> recovery/cross-tab behaviour is synthetic-tested only with the owner's
+> real-Chrome gate. No source or test files changed; all three suites were
+> re-run for this follow-up.
+
 - Worker: dsh (DeepSeek V4.1 Flash), dispatched by the Orca coordinator.
 - Repo: norinori1/X-tweet-csv-exporter (this worktree).
 - Worktree/branch: `C:\Users\Takumi\orca\workspaces\X-tweet-csv-exporter\xtce-s3-new`,
@@ -22,7 +34,7 @@
 | `tests/panel.test.mjs` | New S3 suite (18 groups): fake DOM, fake clock, fake S2 content API, fake Blob/object URLs. Covers rendering, collapse, state/error display, auto-scroll timing/stall/slow retry/growth reset/user switch, CSV/JSON downloads, empty export, clear success/failure, filename helpers, sort order, `DOMContentLoaded` boot, and safety properties. |
 | `tests/parser.test.mjs` | Loads `src/csv.js` before `parser.js`; asserts parser delegates to the shared builder; manifest group updated to the S3 wiring. |
 | `tests/collector.test.mjs` | Loads `src/csv.js` before `parser.js` in the two vm harnesses; manifest group updated to the S3 wiring and file list. |
-| `README.md` | Full Japanese README: install, profile/replies/search usage, panel controls, CSV columns/format, JSON format, storage/privacy, architecture, tests, known limits, real-device checklist. |
+| `README.md` | Full Japanese README: install, profile/replies/search usage (exclusive `until:` boundary), panel controls, CSV columns/format, JSON format, storage/privacy (snapshot plus the WAL copy and its capacity cost), architecture, tests, known limits (synthetic-only recovery/cross-tab, quota, backend-ordering assumption), real-device checklist. |
 | `reports/S3-report.md` | This report. |
 
 No new permissions, no new dependencies, no build step, and no request made by the
@@ -236,8 +248,10 @@ contact X or any other server.
   `<all_urls>`, or new permission.
 - No analytics, telemetry, remote config or API keys. The extension itself makes no
   network requests; the interceptor only reads X's own GraphQL responses.
-- Collected data stays in `chrome.storage.local` (`xtce_<username>`); the panel talks
-  only to the S2 content API and never calls storage directly.
+- Collected data stays in `chrome.storage.local`: the snapshot is `xtce_<username>`,
+  and while a commit is in flight a full copy of the next snapshot is also in
+  `xtce:wal:<username>` until the commit removes it. Nothing leaves the browser; the
+  panel talks only to the S2 content API and never calls storage directly.
 - No build step and no dependencies were added.
 - No push was performed.
 
@@ -256,6 +270,9 @@ A  src/panel.js
 A  tests/panel.test.mjs
 A  reports/S3-report.md
 ```
+
+The review follow-up commit changes only `README.md` and `reports/S3-report.md`;
+no source, test, manifest or popup file changed.
 
 ## Decisions, uncertainties and known limits
 
@@ -279,19 +296,40 @@ A  reports/S3-report.md
   GraphQL payload assumptions are S1's; panel scrolling assumes X's main timeline
   uses window scrolling, and `documentElement/body.scrollHeight` is used as the bottom.
   If X changes its scroll container, manual scrolling still collects.
-- **Storage quota**: large buckets can hit `chrome.storage.local` quota. The panel
-  shows the store's error (with `code` when present), and S2 keeps the bucket dirty
-  and retries; there is no truncation or silent drop.
+- **Storage quota and journal overhead**: `chrome.storage.local` has a roughly
+  10 MB default quota. Every commit writes the complete next snapshot to
+  `xtce:wal:<username>` before the snapshot, so the same data exists twice while
+  committing and the effective capacity can be materially below 10 MB. Quota
+  failures are surfaced in the panel (with `code` when present); S2 keeps the
+  bucket dirty and retries instead of truncating or dropping silently.
+- **Crash-recovery ordering assumption**: journal repair re-writes the snapshot
+  and then removes the journal, relying on the `chrome.storage.local` backend
+  applying operations in issue order. This is a single-writer + durable-journal +
+  backend-ordering argument, not an unconditional guarantee; after the journal is
+  removed, a late orphaned write would not be detectable. This limitation is
+  unchanged from S2 and is now documented in the README again.
+- **Synthetic-only durability and cross-tab evidence**: journal recovery,
+  service-worker restart, two-tab merge, cross-origin serialization and clear
+  propagation are covered only by fake storage/tabs/clocks in
+  `tests/collector.test.mjs`. They are not verified in real Chrome; the owner's
+  real-device check remains the gate.
+- **Search date boundary**: X's `until:` is exclusive, so the README example uses
+  `until:2021-01-01` to cover all of 2020 and says so explicitly. A literal
+  `until:2020-12-31` would exclude Dec 31.
 - **Panel CSS**: X can change its DOM/CSS, and the panel is intentionally a fixed
   overlay at maximum z-index. It is scoped to `#xtce-panel`, but a future X redesign
   may require visual tweaks.
 - **Real-device check is the owner's next step**: load the unpacked extension, open a
   profile, start auto-scroll, confirm the count grows, download CSV/JSON, check Excel
   BOM behaviour, open the replies tab and a date-sliced search, then clear and reload
-  to confirm the bucket does not come back.
+  to confirm the bucket does not come back. The check should also cover the
+  synthetic-only paths: a service-worker restart mid-collection (journal recovery)
+  and two tabs collecting/clearing the same user.
 
 ## What remains
 
-- Orchestrator review of this branch; if it passes, push the branch, open a PR that
-  closes #3, squash-merge it, then the owner performs the real-device check. This
+- Orchestrator review of this branch (including this README/report follow-up); if it
+  passes, push the branch, open a PR that closes #3, squash-merge it, then the owner
+  performs the real-device check. That check should include service-worker
+  restart/recovery and two-tab clear/merge, which are synthetic-only here. This
   worker did not push, open a PR, or claim that the extension works on real X.
