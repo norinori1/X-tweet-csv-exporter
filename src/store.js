@@ -30,21 +30,36 @@
  *   clearCurrent()      -> Promise<void>; clears memory and persisted bucket
  *   flushNow()          -> Promise<void>; writes pending buckets immediately
  *   ensureLoaded(name)  -> Promise<void>; restore-once helper
- *   mergeExternal(name, records) -> add records written by another tab
+ *   mergeExternal(name, value, options) -> apply a snapshot written by another
+ *                              tab (including its clear epoch / removal)
  *   dispose()           -> cancels the pending throttle timer
  *
  * Durability rules:
  *   - A merge-write never runs before that user's initial restore settled and
  *     it always re-reads storage under the injected lock before writing. Two
  *     tabs therefore merge snapshots instead of clobbering each other.
+ *   - Every payload carries a monotonically increasing `clearEpoch`. A clear
+ *     (or a removed storage key) advances it and empties the payload; a merge
+ *     write reads the epoch back and adopts a newer clear instead of writing
+ *     the stale bucket back. This is what stops a stale tab (or an in-flight
+ *     pre-clear write) from resurrecting deleted tweets.
  *   - clearCurrent invalidates any in-flight restore, so an old read cannot
  *     resurrect records after the clear.
  *   - A failed read or write keeps the bucket dirty, records the error for S3
  *     and schedules a retry; it is never reported as success.
+ *   - Web Locks are origin-scoped, so they cannot serialize x.com against
+ *     twitter.com. When peer origins are configured, a writer publishes a
+ *     short-lived per-user lease in chrome.storage.local (shared by every
+ *     origin) and refuses to write while a peer origin's lease is live. The
+ *     lease is registered before the peer read, so two origins cannot both
+ *     observe "no peer" and then write concurrently. A conflict fails closed
+ *     with an XTCE_CROSS_ORIGIN_BUSY error and leaves the bucket dirty.
  *
  * Duplicate ids never increase the count. The newest in-memory record for an
  * id wins, while records restored from storage never replace one that arrived
- * while the read was in flight.
+ * while the read was in flight. A clear wins over any batch that was in memory
+ * when the clear became visible; only batches received after the tab observed
+ * the clear are kept.
  */
 (function (root) {
   'use strict';
@@ -67,6 +82,9 @@
   var USERNAME_RE = /^[A-Za-z0-9_]{1,15}$/;
   var SEARCH_FROM_RE = /(?:^|\s)from:@?([A-Za-z0-9_]{1,15})(?=$|\s)/i;
   var RETRY_MAX_DELAY = 30000;
+  var COORDINATION_PREFIX = 'xtce_coord_';
+  var COORDINATION_TTL = 60000;
+  var CLEAR_PAYLOAD_VERSION = 2;
 
   /** Lowercase and validate a username; returns null when it is not valid. */
   function normalizeUsername(value) {
@@ -192,11 +210,57 @@
     return [];
   }
 
+  /**
+   * Read the clear generation from a stored payload. Payloads written before
+   * the clear epoch existed (or bare arrays) are generation 0.
+   */
+  function clearEpochFromStored(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return 0;
+    }
+    var epoch = value.clearEpoch;
+    if (typeof epoch !== 'number' || !isFinite(epoch) || epoch <= 0) {
+      return 0;
+    }
+    return Math.floor(epoch);
+  }
+
+  /**
+   * chrome.storage.local key for a writer lease. Web Locks are scoped to one
+   * page origin, but this key space is shared by x.com and twitter.com.
+   */
+  function coordinationKey(origin, username) {
+    return (
+      COORDINATION_PREFIX +
+      encodeURIComponent(normalizeOrigin(origin)) +
+      '_' +
+      username
+    );
+  }
+
   function errorMessage(error) {
     if (error && typeof error.message === 'string' && error.message) {
       return error.message;
     }
     return String(error || 'storage operation failed');
+  }
+
+  function coordinationError(message, code) {
+    var error = new Error(message);
+    error.code = code || 'XTCE_COORDINATION_UNAVAILABLE';
+    return error;
+  }
+
+  /** Normalize an origin for lease keys ("HTTPS://X.COM/" -> "https://x.com"). */
+  function normalizeOrigin(value) {
+    if (typeof value !== 'string') {
+      return '';
+    }
+    var normalized = value.trim().toLowerCase();
+    while (normalized && normalized.charAt(normalized.length - 1) === '/') {
+      normalized = normalized.slice(0, -1);
+    }
+    return normalized;
   }
 
   function createStore(options) {
@@ -214,12 +278,37 @@
         : function (name, task) {
             return Promise.resolve().then(task);
           };
+    var origin = normalizeOrigin(opts.origin);
+    var peerOrigins = [];
+    if (origin && Array.isArray(opts.peerOrigins)) {
+      for (var peerIndex = 0; peerIndex < opts.peerOrigins.length; peerIndex += 1) {
+        var peerOrigin = normalizeOrigin(opts.peerOrigins[peerIndex]);
+        if (
+          peerOrigin &&
+          peerOrigin !== origin &&
+          peerOrigins.indexOf(peerOrigin) === -1
+        ) {
+          peerOrigins.push(peerOrigin);
+        }
+      }
+    }
+    var coordinationDelay =
+      typeof opts.coordinationTtl === 'number' && opts.coordinationTtl > 0
+        ? opts.coordinationTtl
+        : COORDINATION_TTL;
+    var clock =
+      typeof opts.now === 'function'
+        ? opts.now
+        : function () {
+            return Date.now();
+          };
 
     var buckets = new Map();
     var loaded = new Set();
     var restorePromises = new Map();
     var restoreVersions = new Map();
     var clearPending = new Set();
+    var clearEpochs = new Map();
     var dirty = new Set();
     var revisions = new Map();
     var retryAttempts = new Map();
@@ -230,6 +319,10 @@
     var lastError = null;
 
     function noop() {}
+
+    function hasOwn(object, key) {
+      return Boolean(object) && Object.prototype.hasOwnProperty.call(object, key);
+    }
 
     function ensureBucket(username) {
       var bucket = buckets.get(username);
@@ -256,7 +349,8 @@
               message: lastError.message,
               operation: lastError.operation,
               username: lastError.username,
-              at: lastError.at
+              at: lastError.at,
+              code: lastError.code || null
             }
           : null
       };
@@ -274,7 +368,8 @@
         message: lastError.message,
         operation: lastError.operation,
         username: lastError.username,
-        at: lastError.at
+        at: lastError.at,
+        code: lastError.code || null
       };
     }
 
@@ -304,7 +399,11 @@
         message: errorMessage(error),
         operation: operation,
         username: username || null,
-        at: new Date().toISOString()
+        at: new Date().toISOString(),
+        code:
+          error && typeof error.code === 'string' && error.code
+            ? error.code
+            : null
       };
       try {
         if (error && typeof error === 'object') {
@@ -400,9 +499,10 @@
 
     function writePayload(username, records) {
       var payload = {
-        version: 1,
+        version: CLEAR_PAYLOAD_VERSION,
         username: username,
         updatedAt: new Date().toISOString(),
+        clearEpoch: clearEpochs.get(username) || 0,
         records: records
       };
       try {
@@ -418,6 +518,187 @@
       } catch (error) {
         return Promise.reject(error);
       }
+    }
+
+    function releaseLease(key) {
+      try {
+        return Promise.resolve(storage.remove(key)).catch(noop);
+      } catch (error) {
+        return Promise.resolve();
+      }
+    }
+
+    /**
+     * Publish this origin's per-user lease and fail closed when a peer origin
+     * currently owns it.
+     *
+     * Web Locks are scoped to the page origin, so x.com and twitter.com tabs
+     * that share chrome.storage.local cannot see each other's locks. The lease
+     * lives in the shared storage instead. The registration is written BEFORE
+     * the peer read: if two origins both saw "no peer", each registration
+     * would have to happen before the other's read, which is impossible in a
+     * sequentially consistent store. At least one writer therefore always
+     * observes the other and refuses to overwrite.
+     *
+     * The lease is released as soon as the write completes, so the peer origin
+     * can retry. If a tab crashes mid-write the lease expires after
+     * `coordinationDelay`.
+     */
+    function acquireLease(username) {
+      if (!origin || peerOrigins.length === 0) {
+        return Promise.resolve(null);
+      }
+      if (
+        !storage ||
+        typeof storage.set !== 'function' ||
+        typeof storage.getMany !== 'function' ||
+        typeof storage.remove !== 'function'
+      ) {
+        return Promise.reject(
+          coordinationError(
+            'Cross-origin coordination is unavailable for ' +
+              username +
+              ': the storage adapter cannot publish writer leases; refusing to write.',
+            'XTCE_COORDINATION_UNAVAILABLE'
+          )
+        );
+      }
+      var ownKey = coordinationKey(origin, username);
+      var peerKeys = peerOrigins.map(function (peer) {
+        return coordinationKey(peer, username);
+      });
+      var startedAt = clock();
+      var lease = {
+        origin: origin,
+        username: username,
+        at: startedAt,
+        expiresAt: startedAt + coordinationDelay,
+        token: String(startedAt) + ':' + Math.random().toString(36).slice(2)
+      };
+      var registered;
+      try {
+        registered = storage.set(ownKey, lease);
+      } catch (error) {
+        return Promise.reject(
+          coordinationError(
+            'Cross-origin coordination failed for ' +
+              username +
+              ': ' +
+              errorMessage(error),
+            'XTCE_COORDINATION_UNAVAILABLE'
+          )
+        );
+      }
+      return Promise.resolve(registered)
+        .then(function () {
+          return storage.getMany(peerKeys);
+        })
+        .then(function (items) {
+          var checkedAt = clock();
+          for (var i = 0; i < peerKeys.length; i += 1) {
+            if (!hasOwn(items, peerKeys[i])) {
+              continue;
+            }
+            var peerLease = items[peerKeys[i]];
+            // A malformed lease is treated as live: we cannot prove the peer
+            // is not writing, so the safe answer is to refuse.
+            var live =
+              !peerLease ||
+              typeof peerLease !== 'object' ||
+              typeof peerLease.expiresAt !== 'number' ||
+              !isFinite(peerLease.expiresAt) ||
+              peerLease.expiresAt > checkedAt;
+            if (live) {
+              throw coordinationError(
+                'The ' +
+                  peerOrigins[i] +
+                  ' origin is writing ' +
+                  username +
+                  '; refusing to overwrite it (cross-origin coordination unavailable).',
+                'XTCE_CROSS_ORIGIN_BUSY'
+              );
+            }
+          }
+          return ownKey;
+        })
+        .catch(function (error) {
+          // Never leave a failed acquisition behind to block the peer.
+          return releaseLease(ownKey).then(function () {
+            if (error && typeof error.code === 'string') {
+              throw error;
+            }
+            throw coordinationError(
+              'Cross-origin coordination failed for ' +
+                username +
+                ': ' +
+                errorMessage(error),
+              'XTCE_COORDINATION_UNAVAILABLE'
+            );
+          });
+        });
+    }
+
+    function runCoordinated(username, task) {
+      if (!origin || peerOrigins.length === 0) {
+        try {
+          return Promise.resolve(task());
+        } catch (error) {
+          return Promise.reject(error);
+        }
+      }
+      return acquireLease(username).then(function (ownKey) {
+        var result;
+        try {
+          result = Promise.resolve(task());
+        } catch (error) {
+          result = Promise.reject(error);
+        }
+        return result.then(
+          function (value) {
+            if (!ownKey) {
+              return value;
+            }
+            // Release only after the user snapshot write settled.
+            return releaseLease(ownKey).then(function () {
+              return value;
+            });
+          },
+          function (error) {
+            if (!ownKey) {
+              throw error;
+            }
+            return releaseLease(ownKey).then(function () {
+              throw error;
+            });
+          }
+        );
+      });
+    }
+
+    /**
+     * Adopt a newer clear generation. Every in-memory record is dropped: the
+     * clear happened while this tab was stale, so its records may predate the
+     * clear. Epochs are monotonic, so this only runs for a genuinely newer
+     * clear. A pending local clear stays pending and will bump the epoch again.
+     */
+    function adoptClear(username, epoch) {
+      var known = clearEpochs.get(username) || 0;
+      if (epoch <= known) {
+        return false;
+      }
+      clearEpochs.set(username, epoch);
+      ensureBucket(username).clear();
+      // Any restore that read the pre-clear body must not merge it back.
+      restoreVersions.set(username, (restoreVersions.get(username) || 0) + 1);
+      revisions.set(username, (revisions.get(username) || 0) + 1);
+      retryAttempts.delete(username);
+      if (clearPending.has(username)) {
+        // The local clear still has to run; keep the bucket dirty so it does.
+        dirty.add(username);
+      } else {
+        dirty.delete(username);
+      }
+      return true;
     }
 
     /**
@@ -464,6 +745,24 @@
           // A clear that happened while this read was in flight wins: do not
           // merge the old body back into memory.
           if ((restoreVersions.get(username) || 0) !== version) {
+            return;
+          }
+          var storedEpoch = clearEpochFromStored(stored);
+          var knownEpoch = clearEpochs.get(username) || 0;
+          if (storedEpoch > knownEpoch) {
+            // Another tab cleared before our read resolved; the body we read
+            // is pre-clear and must not be restored.
+            adoptClear(username, storedEpoch);
+          } else if (storedEpoch < knownEpoch) {
+            // Storage has a pre-clear snapshot (e.g. a stale writer). Never
+            // merge it back; repair the stored clear marker on the next pass.
+            loaded.add(username);
+            retryAttempts.delete(username);
+            dirty.add(username);
+            scheduleFlush();
+            if (currentUser === username) {
+              notify();
+            }
             return;
           }
           var added = mergeRecords(username, recordsFromStored(stored), false);
@@ -568,30 +867,67 @@
           if (!dirty.has(username) || clearPending.has(username)) {
             return undefined;
           }
-          return readStored(username).then(function (stored) {
+          return runCoordinated(username, function () {
             if (!dirty.has(username) || clearPending.has(username)) {
               return undefined;
             }
-            var added = mergeRecords(
-              username,
-              recordsFromStored(stored),
-              false
-            );
-            if (added > 0 && currentUser === username) {
-              notify();
-            }
-            return writePayload(username, snapshot(username)).then(function () {
-              if ((revisions.get(username) || 0) === revision) {
-                dirty.delete(username);
-              } else {
-                // A new batch arrived while the write was in flight; write it
-                // in the next pass instead of dropping it.
-                scheduleFlush();
+            return readStored(username).then(function (stored) {
+              if (clearPending.has(username)) {
+                return undefined;
               }
-              retryAttempts.delete(username);
-              if (clearErrorFor(username)) {
-                notify();
+              var storedEpoch = clearEpochFromStored(stored);
+              var knownEpoch = clearEpochs.get(username) || 0;
+              if (storedEpoch > knownEpoch) {
+                // A clear landed after this tab loaded the bucket. The dirty
+                // batch predates the clear: adopt it, keep only the stored
+                // post-clear records, and never write the stale snapshot.
+                adoptClear(username, storedEpoch);
+                mergeRecords(username, recordsFromStored(stored), false);
+                loaded.add(username);
+                retryAttempts.delete(username);
+                var cleared = clearErrorFor(username);
+                if (cleared || currentUser === username) {
+                  notify();
+                }
+                return undefined;
               }
+              if (storedEpoch === knownEpoch) {
+                var added = mergeRecords(
+                  username,
+                  recordsFromStored(stored),
+                  false
+                );
+                if (added > 0 && currentUser === username) {
+                  notify();
+                }
+              }
+              // storedEpoch < knownEpoch: the stored snapshot predates a clear
+              // this tab already knows about. Never merge it back; the write
+              // below restores the clear marker and post-clear records.
+              if (!dirty.has(username) || clearPending.has(username)) {
+                return undefined;
+              }
+              var writeEpoch = clearEpochs.get(username) || 0;
+              return writePayload(username, snapshot(username)).then(function () {
+                if ((clearEpochs.get(username) || 0) !== writeEpoch) {
+                  // A newer clear was adopted while this pre-clear snapshot
+                  // was in flight; repair storage with the adopted state.
+                  dirty.add(username);
+                  scheduleFlush(0);
+                  return;
+                }
+                if ((revisions.get(username) || 0) === revision) {
+                  dirty.delete(username);
+                } else {
+                  // A new batch arrived while the write was in flight; write it
+                  // in the next pass instead of dropping it.
+                  scheduleFlush();
+                }
+                retryAttempts.delete(username);
+                if (clearErrorFor(username)) {
+                  notify();
+                }
+              });
             });
           });
         });
@@ -607,19 +943,48 @@
         if (!clearPending.has(username)) {
           return undefined;
         }
-        // Deliberately do not read-merge here: clear means empty. If new
-        // tweets arrive afterwards they are written by a later merge pass.
-        return writePayload(username, []).then(function () {
-          clearPending.delete(username);
-          if ((revisions.get(username) || 0) === revision) {
-            dirty.delete(username);
-          } else {
-            scheduleFlush();
+        return runCoordinated(username, function () {
+          if (!clearPending.has(username)) {
+            return undefined;
           }
-          retryAttempts.delete(username);
-          if (clearErrorFor(username)) {
-            notify();
-          }
+          return readStored(username).then(function (stored) {
+            if (!clearPending.has(username)) {
+              return undefined;
+            }
+            // Deliberately do not read-merge records here: clear means empty.
+            // Read only to allocate the next epoch, so a clear that commits
+            // after another tab's clear supersedes it instead of losing.
+            var storedEpoch = clearEpochFromStored(stored);
+            var knownEpoch = clearEpochs.get(username) || 0;
+            var epoch = Math.max(storedEpoch, knownEpoch) + 1;
+            // Reserve the epoch before the write so our own onChanged event
+            // sees the same value. A failed write keeps clearPending and the
+            // retry allocates a higher epoch.
+            clearEpochs.set(username, epoch);
+            return writePayload(username, []).then(function () {
+              clearPending.delete(username);
+              if ((clearEpochs.get(username) || 0) !== epoch) {
+                // A newer clear was adopted while the empty body was in
+                // flight; rewrite the adopted state so its marker survives.
+                retryAttempts.delete(username);
+                clearErrorFor(username);
+                dirty.add(username);
+                scheduleFlush(0);
+                return;
+              }
+              if ((revisions.get(username) || 0) === revision) {
+                dirty.delete(username);
+              } else {
+                // New tweets arrived while the clear was in flight; persist
+                // them in a later merge pass.
+                scheduleFlush();
+              }
+              retryAttempts.delete(username);
+              if (clearErrorFor(username)) {
+                notify();
+              }
+            });
+          });
         });
       });
     }
@@ -734,17 +1099,49 @@
       return flushUser(username);
     }
 
-    function mergeExternal(username, records) {
+    /**
+     * Apply a snapshot written by another tab.
+     *
+     * `value` is either a records array (legacy) or the full stored payload
+     * `{version, username, clearEpoch, records}`. `options.removed` means the
+     * storage key was deleted and the whole bucket must be forgotten.
+     *
+     * A newer `clearEpoch` empties this tab before its records can be merged
+     * or flushed back. A snapshot with an older epoch is ignored, which is the
+     * last line of defence against a stale tab resurrecting a cleared bucket.
+     */
+    function mergeExternal(username, value, options) {
       var next = normalizeUsername(username);
-      if (!next || isReserved(next) || !Array.isArray(records)) {
+      if (!next || isReserved(next)) {
         return 0;
       }
-      // Honour an in-progress clear instead of resurrecting records from a
-      // change event fired by another tab.
+      var opts = options || {};
+      var knownEpoch = clearEpochs.get(next) || 0;
+      if (opts.removed) {
+        var removedEpoch = knownEpoch + 1;
+        adoptClear(next, removedEpoch);
+        if (currentUser === next) {
+          notify();
+        }
+        return 0;
+      }
+      if (!Array.isArray(value) && (!value || typeof value !== 'object')) {
+        return 0;
+      }
+      var epoch = clearEpochFromStored(value);
+      if (epoch > knownEpoch) {
+        adoptClear(next, epoch);
+      } else if (epoch < knownEpoch) {
+        // A pre-clear snapshot must never be merged back, even if it arrived
+        // late through a queued chrome.storage.onChanged event.
+        return 0;
+      }
+      // A local clear is already queued; its write will empty the bucket and
+      // bump the epoch, so merging records here would only resurrect them.
       if (clearPending.has(next)) {
         return 0;
       }
-      var added = mergeRecords(next, records, false);
+      var added = mergeRecords(next, recordsFromStored(value), false);
       if (added > 0 && currentUser === next) {
         notify();
       }
@@ -781,7 +1178,10 @@
     recordsFromStored: recordsFromStored,
     normalizeUsername: normalizeUsername,
     storageKey: storageKey,
+    coordinationKey: coordinationKey,
+    clearEpochFromStored: clearEpochFromStored,
     STORAGE_PREFIX: STORAGE_PREFIX,
+    COORDINATION_PREFIX: COORDINATION_PREFIX,
     RESERVED_SEGMENTS: RESERVED_SEGMENTS
   };
 

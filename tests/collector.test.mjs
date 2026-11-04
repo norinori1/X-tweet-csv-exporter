@@ -111,62 +111,122 @@ function tweetMessages(entries) {
 
 function createFakeStorage(initial) {
   const data = new Map();
-  const calls = { get: [], set: [] };
-  const getHooks = [];
-  const setHooks = [];
+  const calls = { get: [], getMany: [], set: [], remove: [] };
+  const hooks = { get: [], getMany: [], set: [], remove: [] };
   if (initial) {
     for (const key of Object.keys(initial)) {
       data.set(key, clone(initial[key]));
     }
   }
-  function nextGate(hooks) {
-    const hook = hooks.shift();
-    return hook ? hook() : undefined;
+  function matches(matcher, key) {
+    if (!matcher) {
+      return true;
+    }
+    if (typeof matcher === 'function') {
+      return Boolean(matcher(key));
+    }
+    if (Array.isArray(matcher)) {
+      return matcher.indexOf(key) !== -1;
+    }
+    return matcher === key;
   }
-  function defer(hooks) {
+  function nextGate(list, key) {
+    const index = list.findIndex((hook) => matches(hook.key, key));
+    if (index === -1) {
+      return undefined;
+    }
+    return list.splice(index, 1)[0].fn();
+  }
+  function defer(list, key) {
     let resolve;
     let reject;
     const promise = new Promise((res, rej) => {
       resolve = res;
       reject = rej;
     });
-    hooks.push(() => promise);
+    list.push({ key, fn: () => promise });
     return { promise, resolve, reject };
+  }
+  function fail(list, error, key) {
+    list.push({
+      key,
+      fn: () => {
+        throw error;
+      }
+    });
   }
   return {
     data,
     calls,
     async get(key) {
       calls.get.push(key);
-      const gate = nextGate(getHooks);
+      // Snapshot at read time: a read that is released late still returns the
+      // body that existed when it was issued, like a real storage read.
+      const value = data.has(key) ? clone(data.get(key)) : undefined;
+      const gate = nextGate(hooks.get, key);
       if (gate) {
         await gate;
       }
-      return data.has(key) ? clone(data.get(key)) : undefined;
+      return value;
+    },
+    async getMany(keys) {
+      const list = Array.isArray(keys) ? keys.slice() : [keys];
+      calls.getMany.push(list);
+      const snapshot = new Map();
+      for (const key of list) {
+        if (data.has(key)) {
+          snapshot.set(key, clone(data.get(key)));
+        }
+      }
+      const gate = nextGate(hooks.getMany, list);
+      if (gate) {
+        await gate;
+      }
+      const items = {};
+      for (const [key, value] of snapshot) {
+        items[key] = value;
+      }
+      return items;
     },
     async set(key, value) {
       calls.set.push({ key, value: clone(value) });
-      const gate = nextGate(setHooks);
+      const gate = nextGate(hooks.set, key);
       if (gate) {
         await gate;
       }
       data.set(key, clone(value));
     },
-    deferNextGet() {
-      return defer(getHooks);
+    async remove(keys) {
+      const list = Array.isArray(keys) ? keys.slice() : [keys];
+      calls.remove.push(list);
+      const gate = nextGate(hooks.remove, list);
+      if (gate) {
+        await gate;
+      }
+      for (const key of list) {
+        data.delete(key);
+      }
     },
-    deferNextSet() {
-      return defer(setHooks);
+    deferNextGet(key) {
+      return defer(hooks.get, key);
     },
-    failNextGet(error) {
-      getHooks.push(() => {
-        throw error;
-      });
+    deferNextGetMany(key) {
+      return defer(hooks.getMany, key);
     },
-    failNextSet(error) {
-      setHooks.push(() => {
-        throw error;
-      });
+    deferNextSet(key) {
+      return defer(hooks.set, key);
+    },
+    deferNextRemove(key) {
+      return defer(hooks.remove, key);
+    },
+    failNextGet(error, key) {
+      fail(hooks.get, error, key);
+    },
+    failNextGetMany(error, key) {
+      fail(hooks.getMany, error, key);
+    },
+    failNextSet(error, key) {
+      fail(hooks.set, error, key);
     }
   };
 }
@@ -219,6 +279,39 @@ function createFakeLockManager() {
   };
 }
 
+/**
+ * Web Locks are origin-scoped. This manager serializes only tasks in the same
+ * domain, exactly like two navigator.locks instances on x.com and twitter.com:
+ * a task in domain A runs concurrently with a task in domain B.
+ */
+function createDomainLockManager() {
+  const queues = new Map();
+  let active = 0;
+  let maxActive = 0;
+  return {
+    request(domain, name, task) {
+      const key = domain + '|' + name;
+      const previous = queues.get(key) || Promise.resolve();
+      const run = previous.catch(() => {}).then(async () => {
+        active += 1;
+        if (active > maxActive) {
+          maxActive = active;
+        }
+        try {
+          return await task();
+        } finally {
+          active -= 1;
+        }
+      });
+      queues.set(key, run.catch(() => {}));
+      return run;
+    },
+    maxActive() {
+      return maxActive;
+    }
+  };
+}
+
 function createStoreHarness(initialStorage, persistDelay, options) {
   const opts = options || {};
   const storage = opts.storage || createFakeStorage(initialStorage);
@@ -237,9 +330,45 @@ function createStoreHarness(initialStorage, persistDelay, options) {
     persistDelay: persistDelay === undefined ? 500 : persistDelay,
     setTimeout: timers.setTimeout,
     clearTimeout: timers.clearTimeout,
-    withLock: opts.withLock
+    withLock: opts.withLock,
+    origin: opts.origin,
+    peerOrigins: opts.peerOrigins,
+    now: opts.now,
+    coordinationTtl: opts.coordinationTtl
   });
   return { api, store, storage, timers, sandbox };
+}
+
+function createCrossOriginPair(initialStorage) {
+  const storage = createFakeStorage(initialStorage);
+  const locks = createDomainLockManager();
+  const clock = { t: 1000 };
+  const now = () => clock.t;
+  const options = {
+    storage,
+    now,
+    origin: 'https://x.com',
+    peerOrigins: ['https://twitter.com']
+  };
+  const a = createStoreHarness(undefined, 500, {
+    ...options,
+    withLock: (name, task) => locks.request('x.com', name, task)
+  });
+  const bOptions = {
+    storage,
+    now,
+    origin: 'https://twitter.com',
+    peerOrigins: ['https://x.com']
+  };
+  const b = createStoreHarness(undefined, 500, {
+    ...bOptions,
+    withLock: (name, task) => locks.request('twitter.com', name, task)
+  });
+  return { storage, locks, clock, a, b };
+}
+
+function userSetCalls(storage, key) {
+  return storage.calls.set.filter((call) => call.key === key);
 }
 
 function createSharedStorePair(initialStorage) {
@@ -449,8 +578,29 @@ function createInterceptorHarness(options) {
  * Isolated-world collector harness: fake window, chrome.storage and clock
  * ---------------------------------------------------------------------- */
 
-function createFakeChrome(storage) {
-  const onChanged = [];
+/**
+ * Shared change bus used by the two-tab content tests. Chrome notifies every
+ * extension context (including the writer) after a storage mutation.
+ */
+function createChromeChangeBus() {
+  const listeners = new Set();
+  return {
+    addListener(listener) {
+      listeners.add(listener);
+    },
+    removeListener(listener) {
+      listeners.delete(listener);
+    },
+    emit(changes, areaName) {
+      for (const listener of [...listeners]) {
+        listener(changes, areaName || 'local');
+      }
+    }
+  };
+}
+
+function createFakeChrome(storage, bus) {
+  const localListeners = [];
   const runtime = {};
   function setLastError(error) {
     runtime.lastError = {
@@ -460,17 +610,39 @@ function createFakeChrome(storage) {
   function clearLastError() {
     delete runtime.lastError;
   }
+  function deliver(changes) {
+    if (bus) {
+      bus.emit(changes, 'local');
+      return;
+    }
+    for (const listener of localListeners.slice()) {
+      listener(changes, 'local');
+    }
+  }
+  function deliverLater(changes) {
+    // chrome.storage.onChanged is delivered after the callback.
+    Promise.resolve().then(() => deliver(changes));
+  }
+  function stored(key) {
+    return storage.data.has(key) ? clone(storage.data.get(key)) : undefined;
+  }
   const chrome = {
     runtime,
     storage: {
       local: {
-        get(key, callback) {
-          storage.get(key).then(
-            (value) => {
-              const items = {};
-              if (value !== undefined) {
-                items[key] = value;
-              }
+        get(keyOrKeys, callback) {
+          const isMany = Array.isArray(keyOrKeys);
+          const reading = isMany
+            ? storage.getMany(keyOrKeys)
+            : storage.get(keyOrKeys).then((value) => {
+                const items = {};
+                if (value !== undefined) {
+                  items[keyOrKeys] = value;
+                }
+                return items;
+              });
+          reading.then(
+            (items) => {
               clearLastError();
               callback(items);
             },
@@ -485,13 +657,42 @@ function createFakeChrome(storage) {
           );
         },
         set(items, callback) {
-          const keys = Object.keys(items);
-          storage.set(keys[0], items[keys[0]]).then(
+          const key = Object.keys(items)[0];
+          const oldValue = stored(key);
+          const newValue = clone(items[key]);
+          storage.set(key, items[key]).then(
             () => {
               clearLastError();
               if (callback) {
                 callback();
               }
+              deliverLater({ [key]: { oldValue, newValue } });
+            },
+            (error) => {
+              setLastError(error);
+              try {
+                if (callback) {
+                  callback();
+                }
+              } finally {
+                clearLastError();
+              }
+            }
+          );
+        },
+        remove(keyOrKeys, callback) {
+          const keys = Array.isArray(keyOrKeys) ? keyOrKeys : [keyOrKeys];
+          const changes = {};
+          for (const key of keys) {
+            changes[key] = { oldValue: stored(key) };
+          }
+          storage.remove(keys).then(
+            () => {
+              clearLastError();
+              if (callback) {
+                callback();
+              }
+              deliverLater(changes);
             },
             (error) => {
               setLastError(error);
@@ -508,25 +709,36 @@ function createFakeChrome(storage) {
       },
       onChanged: {
         addListener(listener) {
-          onChanged.push(listener);
+          if (bus) {
+            bus.addListener(listener);
+          } else {
+            localListeners.push(listener);
+          }
         },
         removeListener(listener) {
-          const index = onChanged.indexOf(listener);
+          if (bus) {
+            bus.removeListener(listener);
+            return;
+          }
+          const index = localListeners.indexOf(listener);
           if (index !== -1) {
-            onChanged.splice(index, 1);
+            localListeners.splice(index, 1);
           }
         }
       }
     }
   };
-  return { chrome, onChanged };
+  return { chrome, deliver };
 }
 
-function createContentHarnessWithStorage(storage, pathname, search) {
+function createContentHarnessWithStorage(storage, pathname, search, options) {
+  const opts = options || {};
   const timers = createFakeScheduler();
   const listeners = Object.create(null);
   const intervals = [];
-  const fakeChrome = createFakeChrome(storage);
+  const bus = opts.bus || null;
+  const locks = opts.locks || createFakeLockManager();
+  const fakeChrome = createFakeChrome(storage, bus);
   const sandbox = {
     console,
     setTimeout: timers.setTimeout,
@@ -537,6 +749,13 @@ function createContentHarnessWithStorage(storage, pathname, search) {
     },
     clearInterval() {},
     chrome: fakeChrome.chrome,
+    navigator: {
+      locks: {
+        request(name, task) {
+          return locks.request(name, task);
+        }
+      }
+    },
     location: {
       pathname: pathname || '/alice',
       search: search || '',
@@ -575,10 +794,7 @@ function createContentHarnessWithStorage(storage, pathname, search) {
       }
     },
     emitStorageChange(changes, areaName) {
-      const list = fakeChrome.onChanged.slice();
-      for (const listener of list) {
-        listener(changes, areaName || 'local');
-      }
+      fakeChrome.deliver(changes, areaName || 'local');
     }
   };
 }
@@ -677,6 +893,7 @@ function createTwoWorldHarness(options) {
   main.window = main;
   vm.createContext(main);
 
+  const isolatedLocks = createFakeLockManager();
   const isolated = {
     console,
     location,
@@ -688,6 +905,13 @@ function createTwoWorldHarness(options) {
     },
     clearInterval() {},
     chrome: fakeChrome.chrome,
+    navigator: {
+      locks: {
+        request(name, task) {
+          return isolatedLocks.request(name, task);
+        }
+      }
+    },
     postMessage(message, targetOrigin) {
       post('isolated', message, targetOrigin);
     },
@@ -752,7 +976,17 @@ await test('store loads in vm and exposes the S2 helpers', () => {
   assert.equal(typeof api.isTweetMessage, 'function');
   assert.equal(typeof api.recordsFromStored, 'function');
   assert.equal(typeof api.normalizeUsername, 'function');
+  assert.equal(typeof api.clearEpochFromStored, 'function');
+  assert.equal(typeof api.coordinationKey, 'function');
+  assert.equal(api.clearEpochFromStored({ clearEpoch: 3 }), 3);
+  assert.equal(api.clearEpochFromStored({ clearEpoch: -1 }), 0);
+  assert.equal(api.clearEpochFromStored([{ id: '1' }]), 0);
+  assert.equal(
+    api.coordinationKey('https://x.com', 'alice'),
+    'xtce_coord_https%3A%2F%2Fx.com_alice'
+  );
   assert.equal(api.STORAGE_PREFIX, 'xtce_');
+  assert.equal(api.COORDINATION_PREFIX, 'xtce_coord_');
   assert.deepEqual(
     [...api.RESERVED_SEGMENTS],
     [
@@ -1104,6 +1338,389 @@ await test('store merges records written by another tab without marking them dir
   assert.equal(harness.store.getState().count, 1);
   assert.equal(harness.timers.pendingCount(), 0, 'external records are already stored');
   assert.equal(harness.store.mergeExternal('alice', [makeRecord(9)]), 0);
+});
+
+/* -------------------------------------------------------------------------
+ * Cross-tab clear propagation (second review, item 1)
+ * ---------------------------------------------------------------------- */
+
+await test('store applies an external clear snapshot instead of ignoring it', async () => {
+  const harness = createStoreHarness({
+    xtce_alice: {
+      version: 2,
+      username: 'alice',
+      clearEpoch: 0,
+      records: [makeRecord(1), makeRecord(2)]
+    }
+  });
+  await harness.store.switchUser('alice');
+  assert.equal(harness.store.getState().count, 2);
+
+  // Tab A's clear committed while this tab is stale. The full payload has an
+  // empty records array, which the old onChanged path ignored.
+  assert.equal(
+    harness.store.mergeExternal('alice', {
+      version: 2,
+      username: 'alice',
+      clearEpoch: 1,
+      records: []
+    }),
+    0
+  );
+  assert.equal(
+    harness.store.getState().count,
+    0,
+    'an empty snapshot with a newer clear epoch must empty the memory bucket'
+  );
+
+  // A later batch is post-clear and must survive the next merge write.
+  harness.store.ingest([makeRecord(3)]);
+  await harness.store.flushNow();
+  const stored = harness.storage.data.get('xtce_alice');
+  assert.deepEqual(idsOf(stored.records), ['3']);
+  assert.equal(stored.clearEpoch, 1);
+});
+
+await test('store ignores a stale snapshot with an older clear epoch', async () => {
+  const harness = createStoreHarness();
+  await harness.store.switchUser('alice');
+  harness.store.mergeExternal('alice', {
+    version: 2,
+    username: 'alice',
+    clearEpoch: 2,
+    records: []
+  });
+  assert.equal(harness.store.getState().count, 0);
+
+  // A queued pre-clear onChanged event arrives late; it must not resurrect.
+  assert.equal(
+    harness.store.mergeExternal('alice', {
+      version: 2,
+      username: 'alice',
+      clearEpoch: 1,
+      records: [makeRecord(1)]
+    }),
+    0
+  );
+  assert.equal(harness.store.getState().count, 0);
+});
+
+await test('store removes a deleted storage key from memory without writing it back', async () => {
+  const harness = createStoreHarness({
+    xtce_alice: {
+      version: 2,
+      username: 'alice',
+      clearEpoch: 0,
+      records: [makeRecord(1)]
+    }
+  });
+  await harness.store.switchUser('alice');
+  assert.equal(harness.store.getState().count, 1);
+  harness.storage.data.delete('xtce_alice');
+  harness.store.mergeExternal('alice', undefined, { removed: true });
+  assert.equal(harness.store.getState().count, 0);
+  await harness.store.flushNow();
+  assert.equal(
+    harness.storage.data.has('xtce_alice'),
+    false,
+    'a deleted bucket must not be recreated from memory'
+  );
+});
+
+await test('a stale tab re-reads the clear epoch and does not resurrect records', async () => {
+  const harness = createStoreHarness({
+    xtce_alice: {
+      version: 2,
+      username: 'alice',
+      clearEpoch: 0,
+      records: [makeRecord(1), makeRecord(2)]
+    }
+  });
+  await harness.store.switchUser('alice');
+  harness.store.ingest([makeRecord(3)]);
+  assert.equal(harness.store.getState().count, 3);
+
+  // Another tab cleared; this tab was frozen/suspended and never received
+  // chrome.storage.onChanged. Its dirty batch must not win on the next flush.
+  harness.storage.data.set('xtce_alice', {
+    version: 2,
+    username: 'alice',
+    clearEpoch: 1,
+    records: []
+  });
+  await harness.store.flushNow();
+  const stored = harness.storage.data.get('xtce_alice');
+  assert.deepEqual(stored.records, [], 'the cleared records must stay deleted');
+  assert.equal(stored.clearEpoch, 1);
+  assert.equal(harness.store.getState().count, 0);
+});
+
+await test('a clear queued behind an in-flight merge write still wins', async () => {
+  const harness = createStoreHarness({
+    xtce_alice: {
+      version: 2,
+      username: 'alice',
+      clearEpoch: 0,
+      records: [makeRecord(1)]
+    }
+  });
+  await harness.store.switchUser('alice');
+  harness.store.ingest([makeRecord(2)]);
+
+  const gate = harness.storage.deferNextSet('xtce_alice');
+  const flushing = harness.store.flushNow();
+  await waitFor(
+    () => userSetCalls(harness.storage, 'xtce_alice').length === 1,
+    'the merge write to start'
+  );
+  const clearing = harness.store.clearCurrent();
+  await settle();
+  assert.equal(
+    userSetCalls(harness.storage, 'xtce_alice').length,
+    1,
+    'the clear must wait for the in-flight merge write'
+  );
+  gate.resolve();
+  await flushing;
+  await clearing;
+  const stored = harness.storage.data.get('xtce_alice');
+  assert.deepEqual(stored.records, []);
+  assert.equal(stored.clearEpoch, 1);
+});
+
+await test('a cross-tab clear observed during a clear write cannot be overwritten', async () => {
+  const harness = createStoreHarness({
+    xtce_alice: {
+      version: 2,
+      username: 'alice',
+      clearEpoch: 0,
+      records: [makeRecord(1)]
+    }
+  });
+  await harness.store.switchUser('alice');
+
+  const gate = harness.storage.deferNextSet('xtce_alice');
+  const clearing = harness.store.clearCurrent();
+  await waitFor(
+    () => userSetCalls(harness.storage, 'xtce_alice').length === 1,
+    'the clear write to start'
+  );
+
+  // A newer clear commits while our empty body is still in flight.
+  harness.storage.data.set('xtce_alice', {
+    version: 2,
+    username: 'alice',
+    clearEpoch: 2,
+    records: [makeRecord(9)]
+  });
+  harness.store.mergeExternal(
+    'alice',
+    harness.storage.data.get('xtce_alice')
+  );
+  gate.resolve();
+  await clearing;
+
+  // The repair pass keeps the newer clear epoch and does not keep record 9:
+  // the local clear was requested first, so it must not be undone.
+  await harness.store.flushNow();
+  const stored = harness.storage.data.get('xtce_alice');
+  assert.deepEqual(stored.records, []);
+  assert.equal(stored.clearEpoch, 2);
+});
+
+/* -------------------------------------------------------------------------
+ * Cross-origin coordination (second review, item 2)
+ *
+ * The real hazard is that navigator.locks is origin-scoped: an x.com tab and
+ * a twitter.com tab can enter their critical sections at the same time. These
+ * tests use a lock manager that only serializes inside one domain, so the
+ * overlap is real; the shared-storage writer lease is what prevents the
+ * overwrite.
+ * ---------------------------------------------------------------------- */
+
+await test('separate-origin lock domains overlap yet never overwrite each other', async () => {
+  const pair = createCrossOriginPair({
+    xtce_alice: {
+      version: 2,
+      username: 'alice',
+      clearEpoch: 0,
+      records: [makeRecord(1)]
+    }
+  });
+  await pair.a.store.switchUser('alice');
+  await pair.b.store.switchUser('alice');
+  pair.a.store.ingest([makeRecord(2)]);
+  pair.b.store.ingest([makeRecord(3)]);
+  assert.equal(pair.b.store.getState().count, 2);
+
+  const gate = pair.storage.deferNextSet('xtce_alice');
+  const flushingA = pair.a.store.flushNow();
+  await waitFor(
+    () => userSetCalls(pair.storage, 'xtce_alice').length === 1,
+    'A user write to start'
+  );
+
+  const flushingB = pair.b.store.flushNow();
+  await assert.rejects(
+    flushingB,
+    (error) => error && error.code === 'XTCE_CROSS_ORIGIN_BUSY'
+  );
+  assert.ok(
+    pair.locks.maxActive() >= 2,
+    'the two origin locks must really overlap, otherwise this test is vacuous'
+  );
+  assert.equal(
+    userSetCalls(pair.storage, 'xtce_alice').length,
+    1,
+    'the peer origin must not write the user snapshot'
+  );
+  assert.deepEqual(
+    idsOf(pair.storage.data.get('xtce_alice').records),
+    ['1']
+  );
+  assert.equal(
+    pair.b.store.getState().error.code,
+    'XTCE_CROSS_ORIGIN_BUSY'
+  );
+  assert.match(
+    pair.b.store.getState().error.message,
+    /x\.com/,
+    'the refusal must name the origin that owns the lease'
+  );
+
+  gate.resolve();
+  await flushingA;
+  assert.deepEqual(
+    idsOf(pair.storage.data.get('xtce_alice').records).sort(),
+    ['1', '2']
+  );
+
+  // The loser keeps its records in memory and persists them once the lease is
+  // released; a read-merge-write recovers the union.
+  await pair.b.store.flushNow();
+  assert.deepEqual(
+    idsOf(pair.storage.data.get('xtce_alice').records).sort(),
+    ['1', '2', '3']
+  );
+  assert.equal(pair.b.store.getState().error, null);
+});
+
+await test('simultaneous cross-origin lease registrations let only one writer proceed', async () => {
+  const pair = createCrossOriginPair();
+  await pair.a.store.switchUser('alice');
+  await pair.b.store.switchUser('alice');
+  pair.a.store.ingest([makeRecord(2)]);
+  pair.b.store.ingest([makeRecord(3)]);
+
+  const isXLease = (key) =>
+    key.indexOf(pair.a.api.COORDINATION_PREFIX) === 0 &&
+    key.indexOf(encodeURIComponent('https://x.com')) !== -1;
+  const gateA = pair.storage.deferNextSet(isXLease);
+  const flushingA = pair.a.store.flushNow();
+  await waitFor(
+    () => pair.storage.calls.set.some((call) => isXLease(call.key)),
+    'A lease registration'
+  );
+
+  const gateB = pair.storage.deferNextSet('xtce_alice');
+  const flushingB = pair.b.store.flushNow();
+  await waitFor(
+    () => userSetCalls(pair.storage, 'xtce_alice').length === 1,
+    'B user write to start'
+  );
+
+  // A registers after B already read the lease table: A must observe B.
+  gateA.resolve();
+  await assert.rejects(
+    flushingA,
+    (error) => error && error.code === 'XTCE_CROSS_ORIGIN_BUSY'
+  );
+  gateB.resolve();
+  await flushingB;
+
+  assert.deepEqual(
+    idsOf(pair.storage.data.get('xtce_alice').records),
+    ['3'],
+    'only the origin that won the race may write'
+  );
+  assert.equal(pair.a.store.getState().error.code, 'XTCE_CROSS_ORIGIN_BUSY');
+});
+
+await test('a malformed peer lease fails closed without touching the snapshot', async () => {
+  const pair = createCrossOriginPair({
+    xtce_alice: {
+      version: 2,
+      username: 'alice',
+      clearEpoch: 0,
+      records: []
+    }
+  });
+  await pair.a.store.switchUser('alice');
+  const peerKey = pair.a.api.coordinationKey(
+    'https://twitter.com',
+    'alice'
+  );
+  pair.storage.data.set(peerKey, { nonsense: true });
+  pair.a.store.ingest([makeRecord(2)]);
+
+  await assert.rejects(
+    pair.a.store.flushNow(),
+    (error) => error && error.code === 'XTCE_CROSS_ORIGIN_BUSY'
+  );
+  assert.equal(
+    userSetCalls(pair.storage, 'xtce_alice').length,
+    0,
+    'an unreadable peer lease must not allow an overwrite'
+  );
+  assert.match(pair.a.store.getState().error.message, /twitter\.com/);
+
+  // An expired peer lease is ignored, so the tab recovers without a reload.
+  pair.storage.data.get(peerKey).expiresAt = 0;
+  await pair.a.store.flushNow();
+  assert.deepEqual(
+    idsOf(pair.storage.data.get('xtce_alice').records),
+    ['2']
+  );
+});
+
+await test('a failed peer lease read fails closed and also succeeds on retry', async () => {
+  const pair = createCrossOriginPair();
+  await pair.a.store.switchUser('alice');
+  pair.a.store.ingest([makeRecord(2)]);
+  pair.storage.failNextGetMany(new Error('registry read failed'));
+
+  await assert.rejects(
+    pair.a.store.flushNow(),
+    (error) => error && error.code === 'XTCE_COORDINATION_UNAVAILABLE'
+  );
+  assert.match(
+    pair.a.store.getState().error.message,
+    /registry read failed/
+  );
+  assert.equal(userSetCalls(pair.storage, 'xtce_alice').length, 0);
+
+  await pair.a.store.flushNow();
+  assert.deepEqual(
+    idsOf(pair.storage.data.get('xtce_alice').records),
+    ['2']
+  );
+});
+
+await test('a storage adapter without shared-lease APIs fails closed', async () => {
+  const storage = createFakeStorage();
+  delete storage.getMany;
+  const harness = createStoreHarness(undefined, 500, {
+    storage,
+    origin: 'https://x.com',
+    peerOrigins: ['https://twitter.com']
+  });
+  await harness.store.switchUser('alice');
+  harness.store.ingest([makeRecord(1)]);
+  await assert.rejects(
+    harness.store.flushNow(),
+    (error) => error && error.code === 'XTCE_COORDINATION_UNAVAILABLE'
+  );
+  assert.equal(storage.calls.set.length, 0);
 });
 
 /* -------------------------------------------------------------------------
@@ -1697,6 +2314,222 @@ await test('content collector exposes storage read failures instead of treating 
     ['90', '91']
   );
   assert.equal(harness.sandbox.__XTCE_content.getLastError(), null);
+});
+
+/* -------------------------------------------------------------------------
+ * Content-level clear propagation and origin safety (second review, items 1-2)
+ * ---------------------------------------------------------------------- */
+
+await test('content collector applies an empty cross-tab snapshot as a clear', async () => {
+  const harness = createContentHarness({
+    xtce_alice: {
+      version: 2,
+      username: 'alice',
+      clearEpoch: 0,
+      records: [makeRecord(1), makeRecord(2)]
+    }
+  });
+  await settle();
+  assert.equal(harness.sandbox.__XTCE_content.getState().count, 2);
+
+  harness.emitStorageChange({
+    xtce_alice: {
+      oldValue: {
+        version: 2,
+        username: 'alice',
+        clearEpoch: 0,
+        records: [makeRecord(1), makeRecord(2)]
+      },
+      newValue: {
+        version: 2,
+        username: 'alice',
+        clearEpoch: 1,
+        records: []
+      }
+    }
+  });
+  assert.equal(
+    harness.sandbox.__XTCE_content.getState().count,
+    0,
+    'the empty snapshot carries a clear epoch and must not be ignored'
+  );
+
+  harness.emit('message', tweetMessage([makeRecord(3)]));
+  await settle();
+  await harness.sandbox.__XTCE_content.flush();
+  const stored = harness.storage.data.get('xtce_alice');
+  assert.deepEqual(idsOf(stored.records), ['3']);
+  assert.equal(stored.clearEpoch, 1);
+});
+
+await test('content collector treats a removed storage key as a clear', async () => {
+  const harness = createContentHarness({
+    xtce_alice: {
+      version: 2,
+      username: 'alice',
+      clearEpoch: 0,
+      records: [makeRecord(1)]
+    }
+  });
+  await settle();
+  assert.equal(harness.sandbox.__XTCE_content.getState().count, 1);
+
+  // Another context removed the key from chrome.storage.local.
+  harness.storage.data.delete('xtce_alice');
+  harness.emitStorageChange({
+    xtce_alice: {
+      oldValue: {
+        version: 2,
+        username: 'alice',
+        clearEpoch: 0,
+        records: [makeRecord(1)]
+      }
+    }
+  });
+  assert.equal(harness.sandbox.__XTCE_content.getState().count, 0);
+  await harness.sandbox.__XTCE_content.flush();
+  assert.equal(
+    harness.storage.data.has('xtce_alice'),
+    false,
+    'a removed bucket must not be recreated from stale memory'
+  );
+});
+
+await test('a stale tab adopts a live tab clear and never resurrects the records', async () => {
+  const storage = createFakeStorage({
+    xtce_alice: {
+      version: 2,
+      username: 'alice',
+      clearEpoch: 0,
+      records: [makeRecord(1), makeRecord(2)]
+    }
+  });
+  const bus = createChromeChangeBus();
+  const locks = createFakeLockManager();
+  const tabA = createContentHarnessWithStorage(storage, '/alice', '', {
+    bus,
+    locks
+  });
+  const tabB = createContentHarnessWithStorage(storage, '/alice', '', {
+    bus,
+    locks
+  });
+  await settle();
+  assert.equal(tabA.sandbox.__XTCE_content.getState().count, 2);
+  assert.equal(tabB.sandbox.__XTCE_content.getState().count, 2);
+
+  await tabA.sandbox.__XTCE_content.clearCurrent();
+  await settle();
+  assert.equal(
+    tabB.sandbox.__XTCE_content.getState().count,
+    0,
+    'the clear must propagate to the other tab through onChanged'
+  );
+
+  // B later receives a fresh tweet. Flushing it must not bring back 1 and 2.
+  tabB.emit('message', tweetMessage([makeRecord(3)]));
+  await settle();
+  await tabB.sandbox.__XTCE_content.flush();
+  const stored = storage.data.get('xtce_alice');
+  assert.deepEqual(idsOf(stored.records), ['3']);
+  assert.equal(stored.clearEpoch, 1);
+});
+
+await test('a cross-tab clear invalidates an in-flight restore', async () => {
+  const storage = createFakeStorage({
+    xtce_alice: {
+      version: 2,
+      username: 'alice',
+      clearEpoch: 0,
+      records: [makeRecord(1), makeRecord(2)]
+    }
+  });
+  const bus = createChromeChangeBus();
+  const locks = createFakeLockManager();
+  const gate = storage.deferNextGet('xtce_alice');
+  const tabB = createContentHarnessWithStorage(storage, '/alice', '', {
+    bus,
+    locks
+  });
+  await settle();
+  assert.equal(tabB.sandbox.__XTCE_content.getState().count, 0);
+
+  // A second tab can still restore normally; only B's read is deferred.
+  const tabA = createContentHarnessWithStorage(storage, '/alice', '', {
+    bus,
+    locks
+  });
+  await settle();
+  assert.equal(tabA.sandbox.__XTCE_content.getState().count, 2);
+  await tabA.sandbox.__XTCE_content.clearCurrent();
+  await settle();
+  gate.resolve();
+  await settle();
+  assert.equal(
+    tabB.sandbox.__XTCE_content.getState().count,
+    0,
+    'the late restore must not merge the pre-clear body'
+  );
+  assert.deepEqual(storage.data.get('xtce_alice').records, []);
+});
+
+await test('a tab that missed onChanged still refuses to resurrect on flush', async () => {
+  const storage = createFakeStorage({
+    xtce_alice: {
+      version: 2,
+      username: 'alice',
+      clearEpoch: 0,
+      records: [makeRecord(1), makeRecord(2)]
+    }
+  });
+  const tab = createContentHarnessWithStorage(storage, '/alice', '');
+  await settle();
+  assert.equal(tab.sandbox.__XTCE_content.getState().count, 2);
+
+  // A stale batch is pending when another tab clears. This tab is frozen, so
+  // it never sees chrome.storage.onChanged.
+  tab.emit('message', tweetMessage([makeRecord(3)]));
+  await settle();
+  await storage.set('xtce_alice', {
+    version: 2,
+    username: 'alice',
+    clearEpoch: 1,
+    records: []
+  });
+  await tab.sandbox.__XTCE_content.flush();
+
+  const stored = storage.data.get('xtce_alice');
+  assert.deepEqual(stored.records, [], 'the stale flush must not paste 1-3 back');
+  assert.equal(stored.clearEpoch, 1);
+  assert.equal(tab.sandbox.__XTCE_content.getState().count, 0);
+});
+
+await test('content collector surfaces a peer-origin writer conflict', async () => {
+  const harness = createContentHarness();
+  await settle();
+  const storeApi = harness.sandbox.__XTCE_store;
+  const peerKey = storeApi.coordinationKey('https://twitter.com', 'alice');
+  harness.storage.data.set(peerKey, {
+    origin: 'https://twitter.com',
+    username: 'alice',
+    at: Date.now(),
+    expiresAt: Date.now() + 60000
+  });
+
+  harness.emit('message', tweetMessage([makeRecord(1)]));
+  await settle();
+  await assert.rejects(
+    harness.sandbox.__XTCE_content.flush(),
+    (error) => error && error.code === 'XTCE_CROSS_ORIGIN_BUSY'
+  );
+  const error = harness.sandbox.__XTCE_content.getLastError();
+  assert.equal(error.code, 'XTCE_CROSS_ORIGIN_BUSY');
+  assert.match(error.message, /twitter\.com/);
+  assert.equal(
+    harness.storage.data.has('xtce_alice'),
+    false,
+    'the snapshot must not be written while a peer origin may own it'
+  );
 });
 
 /* -------------------------------------------------------------------------

@@ -1,5 +1,10 @@
 # S2 review fixes — d16483a
 
+> Superseded on two points by `reports/S2-review-fixes-2.md` (base 8d17d85):
+> cross-tab `clearCurrent` propagation is now implemented with `clearEpoch`
+> (not left as a known limit), and x.com/twitter.com writers are coordinated
+> through a shared-storage lease because Web Locks are origin-scoped.
+
 - Repo: norinori1/X-tweet-csv-exporter (this worktree).
 - Branch: `norinori1/xtce-s2-new`.
 - Base commit under review: `d16483a` (`feat(s2): add GraphQL interceptor and per-user collector`).
