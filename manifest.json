@@ -8,9 +8,15 @@
   "content_scripts": [
     {
       "matches": ["https://x.com/*", "https://twitter.com/*"],
-      "js": ["src/parser.js"],
+      "js": ["src/parser.js", "src/interceptor.js"],
       "run_at": "document_start",
       "world": "MAIN"
+    },
+    {
+      "matches": ["https://x.com/*", "https://twitter.com/*"],
+      "js": ["src/store.js", "src/content.js"],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
     }
   ]
 }
