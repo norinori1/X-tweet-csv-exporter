@@ -446,6 +446,12 @@ test('manifest keeps the frozen permissions and the S2 content-script wiring', (
     'https://x.com/*',
     'https://twitter.com/*'
   ]);
+  assert.equal(manifest.background.service_worker, 'src/background.js');
+  assert.equal(
+    manifest.background.type,
+    undefined,
+    'the coordinator worker must stay a classic worker so importScripts works'
+  );
   assert.equal(manifest.content_scripts.length, 2);
   assert.deepEqual(manifest.content_scripts[0].js, ['src/parser.js', 'src/interceptor.js']);
   assert.deepEqual(manifest.content_scripts[0].matches, [

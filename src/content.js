@@ -2,8 +2,9 @@
  * X Tweet CSV Exporter (Local) — isolated-world collector (S2).
  *
  * Listens for XTCE_TWEETS batches from the MAIN-world interceptor, dedupes
- * them by tweet id in the current profile's Map, and persists each profile
- * under `xtce_<username>` in chrome.storage.local (throttled to ~500 ms).
+ * them by tweet id in the current profile's Map, and asks the extension
+ * service worker to persist each profile under `xtce_<username>` in
+ * chrome.storage.local (throttled to ~500 ms).
  *
  * Loaded at document_start in the ISOLATED world. The interceptor also runs
  * at document_start, but the two worlds are not ordered relative to each
@@ -27,21 +28,21 @@
  *   ingested. TweetDetail replies by other people and other authors' tweets
  *   from Likes therefore never pollute a person export.
  *
- * Storage:
- *   - chrome.runtime.lastError is checked and converted into a rejected
- *     promise; quota/read failures are never reported as success.
- *   - The store keeps failed writes dirty and retries with backoff.
- *   - Merge-on-write (under navigator.locks when available) means two tabs on
- *     the same origin collecting the same user add to the snapshot instead of
- *     clobbering it.
+ * Persistence:
+ *   - This content script never calls chrome.storage.local.set for a user
+ *     snapshot. Every read and write is an XTCE_COORDINATE message to the MV3
+ *     service worker (src/background.js), which owns the only writer queue.
+ *     navigator.locks is origin-scoped and is not used at all: the service
+ *     worker serializes x.com, twitter.com and every tab through one per-user
+ *     queue. There is no per-origin lock fallback.
+ *   - If the service worker cannot be reached, does not answer within the
+ *     timeout, or returns an error, the store keeps the bucket dirty and
+ *     surfaces XTCE_COORDINATION_UNAVAILABLE / XTCE_COORDINATION_TIMEOUT.
+ *     It never writes directly to storage as a best-effort fallback.
  *   - chrome.storage.onChanged applies records *and clears* written by another
- *     tab. Empty snapshots are no longer ignored: the payload's clearEpoch
- *     tells a tab to drop records that predate the clear, so a stale tab
- *     cannot re-flush them.
- *   - navigator.locks is origin-scoped, so x.com and twitter.com tabs cannot
- *     serialize through it. The store publishes a short-lived per-user writer
- *     lease in chrome.storage.local (shared by both origins) and fails closed
- *     with XTCE_CROSS_ORIGIN_BUSY instead of overwriting a peer origin.
+ *     tab. Empty snapshots are not ignored: the payload's clearEpoch tells a
+ *     tab to drop records that predate the clear, so a stale tab cannot
+ *     re-flush them. The write-ahead journal keys (xtce:wal:*) are ignored.
  *
  * S3 API (isolated world, globalThis.__XTCE_content):
  *   getState()        -> { username, count, records, error }
@@ -52,8 +53,8 @@
  *   clearCurrent()    -> Promise<void> (rejects on storage/coordination failure)
  *   flush()           -> Promise<void> (rejects on storage/coordination failure)
  *
- * Coordination errors carry `code` so S3 can distinguish an unavoidable
- * cross-origin conflict (XTCE_CROSS_ORIGIN_BUSY) from a quota failure.
+ * Coordination errors carry `code` so S3 can distinguish a failed handoff to
+ * the service worker from a quota failure (quota failures have no code).
  */
 (function () {
   'use strict';
@@ -68,149 +69,187 @@
     return;
   }
 
+  var DEFAULT_COORDINATE_TIMEOUT = 15000;
+  var coordinateTimeout =
+    typeof root.__XTCE_COORDINATION_TIMEOUT_MS === 'number' &&
+    root.__XTCE_COORDINATION_TIMEOUT_MS > 0
+      ? root.__XTCE_COORDINATION_TIMEOUT_MS
+      : DEFAULT_COORDINATE_TIMEOUT;
+
   function noop() {}
 
-  function hasOwn(object, key) {
-    return Boolean(object) && Object.prototype.hasOwnProperty.call(object, key);
+  function coordinationError(message, code) {
+    var error = new Error(message);
+    error.code = code || 'XTCE_COORDINATION_UNAVAILABLE';
+    return error;
   }
 
   /**
-   * Read chrome.runtime.lastError inside the storage callback. Returning it
-   * instead of swallowing it is what lets the store keep a dirty retry and
-   * lets S3 display the quota/read failure.
+   * Read chrome.runtime.lastError inside a sendMessage callback. Returning it
+   * instead of swallowing it is what turns a closed port or a rejected
+   * message into a visible failure (and a dirty retry), never into a success.
    */
-  function storageLastError() {
+  function runtimeLastError() {
     try {
       if (
         typeof chrome !== 'undefined' &&
         chrome.runtime &&
         chrome.runtime.lastError
       ) {
-        return new Error(
-          chrome.runtime.lastError.message || 'chrome.storage operation failed'
+        return (
+          chrome.runtime.lastError.message || 'extension messaging failed'
         );
       }
     } catch (error) {
-      return error instanceof Error ? error : new Error(String(error));
+      return error && error.message ? error.message : String(error);
     }
     return null;
   }
 
-  var storage = {
-    get: function (key) {
-      return new Promise(function (resolve, reject) {
-        try {
-          chrome.storage.local.get(key, function (items) {
-            var error = storageLastError();
-            if (error) {
-              reject(error);
+  /**
+   * Send one coordinator request to the MV3 service worker. Resolves only with
+   * the service worker's committed payload; rejects on messaging errors,
+   * timeouts and coordinator rejections. The timeout matters when Chrome
+   * evicts the worker without closing the port promptly: an unanswered write
+   * must never be reported as committed.
+   */
+  function sendCoordinatorRequest(request) {
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      var timer = null;
+
+      function finish(callback, value) {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timer !== null) {
+          try {
+            clearTimeout(timer);
+          } catch (error) {
+            /* A frozen window must not break the failure path. */
+          }
+          timer = null;
+        }
+        callback(value);
+      }
+
+      var sendMessage = null;
+      try {
+        sendMessage =
+          typeof chrome !== 'undefined' && chrome.runtime
+            ? chrome.runtime.sendMessage
+            : null;
+      } catch (error) {
+        sendMessage = null;
+      }
+      if (typeof sendMessage !== 'function') {
+        reject(
+          coordinationError(
+            'The extension service worker is unavailable; refusing to read or ' +
+              'write snapshots without serialization.',
+            'XTCE_COORDINATION_UNAVAILABLE'
+          )
+        );
+        return;
+      }
+
+      timer = setTimeout(function () {
+        finish(
+          reject,
+          coordinationError(
+            'The extension service worker did not answer within ' +
+              coordinateTimeout +
+              'ms; refusing to treat the snapshot write as committed.',
+            'XTCE_COORDINATION_TIMEOUT'
+          )
+        );
+      }, coordinateTimeout);
+
+      try {
+        chrome.runtime.sendMessage(
+          { type: storeApi.COORDINATE_MESSAGE, request: request },
+          function (response) {
+            var lastError = runtimeLastError();
+            if (lastError) {
+              finish(
+                reject,
+                coordinationError(
+                  'Extension messaging failed: ' + lastError,
+                  'XTCE_COORDINATION_UNAVAILABLE'
+                )
+              );
               return;
             }
-            resolve(hasOwn(items, key) ? items[key] : undefined);
-          });
-        } catch (error) {
-          reject(error);
-        }
-      });
+            if (!response || typeof response !== 'object') {
+              finish(
+                reject,
+                coordinationError(
+                  'The extension service worker returned no result; refusing ' +
+                    'to treat the snapshot write as committed.',
+                  'XTCE_COORDINATION_UNAVAILABLE'
+                )
+              );
+              return;
+            }
+            if (response.ok) {
+              var result = response.result;
+              if (
+                request &&
+                request.op !== 'recover' &&
+                (!result || typeof result !== 'object')
+              ) {
+                finish(
+                  reject,
+                  coordinationError(
+                    'The extension service worker returned an invalid ' +
+                      'snapshot; refusing to treat the write as committed.',
+                    'XTCE_COORDINATION_UNAVAILABLE'
+                  )
+                );
+                return;
+              }
+              finish(resolve, result);
+              return;
+            }
+            var details = response.error || {};
+            var error = new Error(
+              details.message ||
+                'The extension service worker rejected the request.'
+            );
+            if (typeof details.code === 'string' && details.code) {
+              error.code = details.code;
+            }
+            finish(reject, error);
+          }
+        );
+      } catch (error) {
+        finish(
+          reject,
+          coordinationError(
+            'Extension messaging failed: ' +
+              (error && error.message ? error.message : String(error)),
+            'XTCE_COORDINATION_UNAVAILABLE'
+          )
+        );
+      }
+    });
+  }
+
+  var coordinator = {
+    read: function (username) {
+      return sendCoordinatorRequest({ op: 'read', username: username });
     },
-    set: function (key, value) {
-      return new Promise(function (resolve, reject) {
-        try {
-          var items = {};
-          items[key] = value;
-          chrome.storage.local.set(items, function () {
-            var error = storageLastError();
-            if (error) {
-              reject(error);
-              return;
-            }
-            resolve();
-          });
-        } catch (error) {
-          reject(error);
-        }
-      });
-    },
-    /**
-     * Read the peer origin's writer lease. The store uses this to detect an
-     * x.com/twitter.com writer that a same-origin Web Lock cannot see.
-     */
-    getMany: function (keys) {
-      return new Promise(function (resolve, reject) {
-        try {
-          chrome.storage.local.get(keys, function (items) {
-            var error = storageLastError();
-            if (error) {
-              reject(error);
-              return;
-            }
-            resolve(items || {});
-          });
-        } catch (error) {
-          reject(error);
-        }
-      });
-    },
-    remove: function (keys) {
-      return new Promise(function (resolve, reject) {
-        try {
-          chrome.storage.local.remove(keys, function () {
-            var error = storageLastError();
-            if (error) {
-              reject(error);
-              return;
-            }
-            resolve();
-          });
-        } catch (error) {
-          reject(error);
-        }
-      });
+    commit: function (request) {
+      return sendCoordinatorRequest(request);
     }
   };
-
-  /**
-   * Web Locks are origin-scoped, so two tabs of the same origin serialize
-   * their read-merge-write on the same user bucket. They cannot coordinate
-   * x.com against twitter.com; the store's shared storage lease does that.
-   */
-  function withUserLock(username, task) {
-    try {
-      var locks =
-        typeof navigator !== 'undefined' && navigator ? navigator.locks : null;
-      if (locks && typeof locks.request === 'function') {
-        return locks.request('xtce_lock_' + username, task);
-      }
-    } catch (error) {
-      /* Fall through to the in-process chain. */
-    }
-    return Promise.resolve().then(task);
-  }
-
-  // The extension only runs on these two hosts (manifest host_permissions),
-  // and both share chrome.storage.local. Web Locks never cross this boundary.
-  var COORDINATION_ORIGINS = ['https://x.com', 'https://twitter.com'];
-  var pageOrigin = '';
-  try {
-    pageOrigin =
-      win.location && typeof win.location.origin === 'string'
-        ? win.location.origin
-        : '';
-  } catch (error) {
-    pageOrigin = '';
-  }
-  var peerOrigins = COORDINATION_ORIGINS.filter(function (candidate) {
-    return candidate !== pageOrigin;
-  });
 
   var store;
   try {
     store = storeApi.createStore({
-      storage: storage,
-      persistDelay: 500,
-      withLock: withUserLock,
-      origin: pageOrigin,
-      peerOrigins: peerOrigins
+      coordinator: coordinator,
+      persistDelay: 500
     });
   } catch (error) {
     return;
@@ -390,11 +429,11 @@
         return;
       }
       Object.keys(changes).forEach(function (key) {
-        if (key.indexOf(storeApi.STORAGE_PREFIX) !== 0) {
+        // Write-ahead journal entries share the area but are not user buckets.
+        if (key.indexOf(storeApi.WAL_PREFIX) === 0) {
           return;
         }
-        // Writer leases share the storage area but are not user buckets.
-        if (key.indexOf(storeApi.COORDINATION_PREFIX) === 0) {
+        if (key.indexOf(storeApi.STORAGE_PREFIX) !== 0) {
           return;
         }
         var change = changes[key];
