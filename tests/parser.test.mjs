@@ -477,7 +477,7 @@ test('manifest keeps the frozen permissions and the S3 content-script wiring', (
   assert.equal(manifest.content_scripts[0].world, 'MAIN');
   assert.equal(manifest.content_scripts[0].run_at, 'document_start');
   assert.deepEqual(manifest.content_scripts[1].js, [
-    'src/csv.js',
+    'src/csv-isolated.js',
     'src/store.js',
     'src/content.js',
     'src/panel.js'

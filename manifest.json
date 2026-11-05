@@ -21,7 +21,7 @@
     },
     {
       "matches": ["https://x.com/*", "https://twitter.com/*"],
-      "js": ["src/csv.js", "src/store.js", "src/content.js", "src/panel.js"],
+      "js": ["src/csv-isolated.js", "src/store.js", "src/content.js", "src/panel.js"],
       "css": ["src/panel.css"],
       "run_at": "document_start",
       "world": "ISOLATED"
