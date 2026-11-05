@@ -2319,11 +2319,23 @@ await test('manifest wires MAIN interceptor and isolated collector with frozen p
 
   const isolated = manifest.content_scripts[1];
   assert.deepEqual(isolated.js, [
-    'src/csv.js',
+    'src/csv-isolated.js',
     'src/store.js',
     'src/content.js',
     'src/panel.js'
   ]);
+  // Chrome does not inject the same file path into a second world: listing
+  // src/csv.js in both content_scripts entries silently skips it in ISOLATED.
+  // The isolated copy must therefore stay byte-identical to src/csv.js.
+  const isolatedCsvSource = readFileSync(
+    new URL('../src/csv-isolated.js', import.meta.url),
+    'utf8'
+  );
+  assert.equal(
+    isolatedCsvSource,
+    csvSource,
+    'src/csv-isolated.js must stay a byte-identical copy of src/csv.js'
+  );
   assert.deepEqual(isolated.css, ['src/panel.css']);
   assert.deepEqual(isolated.matches, ['https://x.com/*', 'https://twitter.com/*']);
   assert.equal(isolated.world, 'ISOLATED');
